@@ -677,7 +677,7 @@ async function decryptJSON(enc, pw) {
  * GitHub Contents API로 파일 하나를 만들거나 덮어쓴다 (토큰: Contents 읽기·쓰기 권한) */
 const GH_KEY = 'exam_generator_github_v1';
 // 기본 저장 위치 (토큰은 보안상 코드에 넣지 않고, 관리자 PC 브라우저에만 저장)
-const DEFAULT_GH = { owner: 'skyisonecolor', repo: 'Elective-subjects', branch: 'main', path: 'viewer/index.html', pages: '' };
+const DEFAULT_GH = { owner: 'skyisonecolor-tech', repo: 'Elective-subjects', branch: 'main', path: 'viewer/index.html', pages: '' };
 const loadGh = () => { let v = {}; try { v = JSON.parse(safeStorage.get(GH_KEY) || '{}'); } catch (e) { v = {}; } const o = { ...DEFAULT_GH, token: '' }; Object.keys(v).forEach(k => { if (v[k]) o[k] = v[k]; }); return o; };
 const saveGh = gh => safeStorage.set(GH_KEY, JSON.stringify({ owner: gh.owner.trim(), repo: gh.repo.trim(), branch: gh.branch.trim(), path: gh.path.trim(), pages: (gh.pages || '').trim(), token: (gh.token || '').trim() }));
 const maskToken = t => (t ? `${t.slice(0, 11)}…${t.slice(-4)}` : '');
