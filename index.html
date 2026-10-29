@@ -1,0 +1,1178 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>정기고사 응시현황 생성기</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;900&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.11"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<style id="base-style">
+  html, body { background: #f1f5f9; color: #0f172a; }
+  body { font-family: 'Noto Sans KR', 'Malgun Gothic', system-ui, sans-serif; margin: 0; }
+  .tt-select { font-size: 11px; }
+  details > summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script id="app">
+'use strict';
+/* =====================================================================
+ * 고등학교 정기시험 선택과목 고정·이동반 응시현황 생성기 (v8)
+ *  - 1·2·3학년 명단 동시 업로드 / 학년 자동 감지
+ *  - 전출·위탁 등 자동 제외, 제외 인원을 뺀 '실제 인원' 기준 이동반 산정
+ *  - 학년 > 학급 2단 선택
+ *  - 학년별 시간표·과목코드 업로드 / 확인 / 직접 수정 (자기주도학습 포함)
+ * ===================================================================== */
+const { useState, useMemo, useEffect, useRef, Fragment } = React;
+// 일반 사용자용 파일이면 관리자가 넣어 둔 결과 데이터가 여기에 들어 있다 (없으면 관리자 모드)
+const VIEWER = window.__VIEWER__ || null;
+const html = htm.bind(React.createElement);
+
+const SELF = '자기주도학습';
+const GRADES = [1, 2, 3];
+const CONFIG_KEY = 'exam_generator_config_v8';
+const DEFAULT_KEYWORDS = '전출, 위탁, 자퇴, 퇴학, 제적, 유예, 휴학, 결번';
+const DEFAULT_LABELS = { 1: '9월 28일 월요일', 2: '9월 29일 화요일', 3: '9월 30일 수요일', 4: '10월 1일 목요일', 5: '10월 2일 금요일' };
+const DEFAULT_MOVE = { dir: 'front', count: 18 };
+
+// 학교 기본 과목코드 (첨부 양식 기준)
+const DEFAULT_CODES = {
+  1: [['01','공통국어2'],['02','공통수학2'],['03','공통영어2'],['04','한국사2'],['05','통합사회2'],['06','통합과학2'],['07','과학탐구실험2'],['08','체육2'],['09','인공지능 기초'],['10','알고리즘 설계']],
+  2: [['01','화법과 언어'],['02','미적분Ⅰ'],['03','인공지능 수학'],['04','영어Ⅱ'],['05','도시의 미래 탐구'],['06','동아시아 역사 기행'],['07','법과 사회'],['08','윤리와 사상'],['09','사회문제 탐구'],['10','전자기와 양자'],['11','화학 반응의 세계'],['12','세포와 물질대사'],['13','지구시스템과학'],['14','융합과학 탐구'],['15','정보과학'],['16','심화 중국어'],['17','심화 일본어'],['18','언어생활과 한자'],['19','스포츠 생활1'],['20','음악'],['21','미술'],['22','로봇과 공학세계']],
+  3: [['01','화법과 작문'],['02','언어와 매체'],['03','심화 국어'],['04','문학과 매체'],['05','미적분'],['06','확률과 통계'],['07','수학과제 탐구'],['08','인공지능 수학'],['09','영어 독해와 작문'],['10','진로 영어'],['11','심화 영어Ⅰ'],['12','세계지리'],['13','세계사'],['14','정치와 법'],['15','생활과 윤리'],['16','여행지리'],['17','사회문제 탐구'],['18','물리학Ⅱ'],['19','화학Ⅱ'],['20','생명과학Ⅱ'],['21','지구과학Ⅱ'],['22','생활과 과학'],['23','정보과학'],['24','스포츠 생활'],['25','체육 전공 실기 기초'],['26','음악 연주'],['27','미술 창작'],['28','중국어 회화Ⅰ'],['29','일본어 회화Ⅰ'],['31','생활과 한문']],
+};
+const defaultCodes = () => Object.fromEntries(GRADES.map(g => [g, DEFAULT_CODES[g].map(([code, name]) => ({ code, name }))]));
+
+/* ---------------------------- 공통 유틸 ---------------------------- */
+const norm = s => String(s ?? '').toLowerCase().replace(/\s+/g, '')
+  .replace(/Ⅰ/g, 'i').replace(/Ⅱ/g, 'ii').replace(/Ⅲ/g, 'iii').replace(/Ⅳ/g, 'iv');
+const isSelf = s => { const n = norm(s); return n === norm(SELF) || n === '자습'; };
+const pad2 = v => { const m = String(v ?? '').match(/\d+/); return m ? String(parseInt(m[0], 10)).padStart(2, '0') : ''; };
+const lastInt = v => { const m = String(v ?? '').split('.')[0].match(/\d+/g); return m ? parseInt(m[m.length - 1], 10) : null; };
+const truthy = v => { const t = String(v ?? '').trim(); return !['', '.', '0', 'nan', 'NaN', '-', 'x', 'X', '×', 'false', 'FALSE', 'N'].includes(t); };
+const parseKeywords = s => String(s || '').split(/[,\n]/).map(x => x.trim()).filter(Boolean);
+const clsKey = (g, c) => `${g}-${c}`;
+const byNum = (a, b) => a.n - b.n;
+const deepClone = o => JSON.parse(JSON.stringify(o));
+const safeStorage = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } },
+};
+
+function emptyTT() {
+  return Object.fromEntries(GRADES.map(g => [g, { days: 5, periods: 3, labels: { ...DEFAULT_LABELS }, cells: {} }]));
+}
+
+/* ------------------------- 명단(학생) 파싱 ------------------------- */
+const META_EXACT = new Set(['순번','번호','출석번호','no','신학번','학번','이름','성명','학생명','성별','반','학급','학년','배정','학기','학교지정','기초','일시','분반','구분','비고','총점','상태','합계','특이사항','학적','학적상태','생년월일','연락처','담임']);
+const META_PAT = [/^\d+$/, /학기/, /택\s*\d/, /학교지정/, /배정/, /^$/, /[월화수목금]\)/, /unnamed/i, /__empty/i, /비고/, /학적/];
+const isMetaCol = h => { const t = String(h ?? '').trim(); return META_EXACT.has(t.toLowerCase()) || META_PAT.some(r => r.test(t)); };
+const gradeHint = s => { const m = String(s || '').match(/([1-3])\s*학년/); return m ? +m[1] : null; };
+function parseIdNum(id) {
+  const d = String(id || '').replace(/\D/g, '');
+  if (/^[1-3]\d{4}$/.test(d)) return { g: +d[0], c: +d.slice(1, 3), n: +d.slice(3) };
+  if (/^[1-3]\d{3}$/.test(d)) return { g: +d[0], c: +d[1], n: +d.slice(2) };
+  return null;
+}
+function findHeaderRow(rows) {
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const r = (rows[i] || []).map(c => String(c).trim());
+    if (r.some(c => /^(이름|성명|학생명)$/.test(c)) && r.some(c => /^(반|학급|번호|출석번호|순번|학번|신학번)$/.test(c))) return i;
+  }
+  return -1;
+}
+const idxOf = (headers, cands) => { for (const c of cands) { const i = headers.indexOf(c); if (i >= 0) return i; } return -1; };
+
+function parseRosterSheet(rows, sheetName, fileName, keywords) {
+  const h = findHeaderRow(rows);
+  if (h < 0) return null;
+  const headers = rows[h].map(c => String(c ?? '').replace(/\s*\n\s*/g, ' ').trim());
+  const ci = {
+    grade: idxOf(headers, ['학년']), cls: idxOf(headers, ['반', '학급']),
+    num: idxOf(headers, ['번호', '출석번호', '순번', 'No', 'no', 'NO']),
+    name: idxOf(headers, ['이름', '성명', '학생명']), id: idxOf(headers, ['학번', '신학번']), gender: idxOf(headers, ['성별']),
+  };
+  const used = new Set(Object.values(ci).filter(i => i >= 0));
+  const exclCols = [], subjCols = [];
+  headers.forEach((hd, i) => {
+    if (used.has(i) || !hd) return;
+    if (keywords.some(k => hd.includes(k))) { exclCols.push(i); return; }
+    if (isMetaCol(hd)) return;
+    subjCols.push(i);
+  });
+  const subjSet = new Set(subjCols);
+  const hint = gradeHint(sheetName) || gradeHint(fileName);
+  const tmp = []; let skipped = 0;
+  for (let r = h + 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row) continue;
+    const cell = i => (i >= 0 ? String(row[i] ?? '').trim() : '');
+    const name = cell(ci.name);
+    if (!name || name === '.' || /^\d+$/.test(name) || /합계|소계|평균|총점/.test(name)) continue;
+    let g = ci.grade >= 0 ? lastInt(cell(ci.grade)) : null;
+    let c = ci.cls >= 0 ? lastInt(cell(ci.cls)) : null;
+    let n = ci.num >= 0 ? lastInt(cell(ci.num)) : null;
+    const idp = parseIdNum(cell(ci.id));
+    if (idp) { if (!g) g = idp.g; if (!c) c = idp.c; if (!n) n = idp.n; }
+    if (!c || c < 1 || c > 20 || !n || n < 1) { skipped++; continue; }
+    if (!(g >= 1 && g <= 3)) g = null;
+    // 전출·위탁 등 제외 판단: 과목 열을 뺀 모든 칸(이름·비고 등)에 키워드가 있으면 제외
+    let reason = '';
+    for (let i = 0; i < row.length && !reason; i++) {
+      if (subjSet.has(i)) continue;
+      const v = String(row[i] ?? '');
+      const k = keywords.find(k => v.includes(k));
+      if (k) reason = k;
+    }
+    if (!reason) for (const i of exclCols) if (truthy(row[i])) { reason = headers[i]; break; }
+    const taken = subjCols.filter(i => truthy(row[i])).map(i => headers[i]);
+    tmp.push({ g, c, n, id: cell(ci.id), name, gender: cell(ci.gender), taken, excluded: !!reason, reason });
+  }
+  const cnt = {}; tmp.forEach(s => { if (s.g) cnt[s.g] = (cnt[s.g] || 0) + 1; });
+  const maj = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
+  const fallback = hint || (maj ? +maj : null);
+  const students = []; let unknownGrade = 0;
+  tmp.forEach(s => { if (!s.g) s.g = fallback; if (!s.g) { unknownGrade++; return; } students.push(s); });
+  const grades = [...new Set(students.map(s => s.g))];
+  return { students, grades, subjectHeaders: subjCols.map(i => headers[i]), skipped, unknownGrade, sheetName, fileName };
+}
+
+// 여러 파일·여러 시트를 한 번에 합쳐서 학생 목록으로 만든다
+function buildRoster(sources, keywords) {
+  const map = new Map(); let dup = 0, skipped = 0, unknownGrade = 0;
+  const subjects = { 1: new Set(), 2: new Set(), 3: new Set() };
+  const sheets = [];
+  sources.forEach(src => src.sheets.forEach(sh => {
+    const res = parseRosterSheet(sh.rows, sh.name, src.fileName, keywords);
+    if (!res || res.students.length === 0) return;
+    skipped += res.skipped; unknownGrade += res.unknownGrade;
+    res.grades.forEach(g => res.subjectHeaders.forEach(hd => subjects[g].add(hd)));
+    sheets.push({ file: src.fileName, sheet: sh.name, grades: res.grades.sort(), count: res.students.length });
+    res.students.forEach(s => { const k = `${s.g}-${s.c}-${s.n}`; if (map.has(k)) dup++; map.set(k, s); });
+  }));
+  const students = [...map.values()].map(s => ({ ...s, takenNorm: new Set(s.taken.map(norm)) }))
+    .sort((a, b) => a.g - b.g || a.c - b.c || a.n - b.n);
+  return {
+    students, dup, skipped, unknownGrade, sheets,
+    subjectsByGrade: Object.fromEntries(GRADES.map(g => [g, [...subjects[g]]])),
+  };
+}
+
+/* ------------------------ 시간표·과목코드 파싱 ------------------------ */
+function parseTTSheet(rows) {
+  let hr = -1;
+  for (let i = 0; i < Math.min(rows.length, 10); i++) if ((rows[i] || []).some(c => /\d+\s*일차/.test(String(c)))) { hr = i; break; }
+  if (hr < 0) return null;
+  const dayCols = new Map();
+  rows[hr].forEach((c, i) => { const m = String(c).match(/(\d+)\s*일차/); if (m) dayCols.set(i, +m[1]); });
+  const labels = {};
+  if (hr > 0) dayCols.forEach((d, i) => {
+    const v = String(rows[hr - 1][i] ?? '').trim();
+    if (v && !v.includes('날짜') && !v.includes('→')) labels[d] = v;
+  });
+  const cells = {}; let maxP = 0;
+  for (let r = hr + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const first = String(row[0] ?? '').trim();
+    if (first.startsWith('※')) break;
+    const m = first.match(/(\d+)\s*교시/) || first.match(/^(\d+)$/);
+    if (!m) continue;
+    const p = +m[1];
+    dayCols.forEach((d, i) => {
+      const v = String(row[i] ?? '').trim();
+      if (!v || v === '-' || v.startsWith('※')) return;
+      const subs = v.split(/[\/,\n]/).map(x => x.trim()).filter(Boolean);
+      if (subs.length) { cells[`${d}-${p}`] = subs; maxP = Math.max(maxP, p); }
+    });
+  }
+  return { days: Math.max(1, ...dayCols.values()), periods: Math.max(3, maxP), labels, cells };
+}
+function parseCodeSheet(rows) {
+  const list = [];
+  rows.forEach(row => {
+    const code = String(row?.[0] ?? '').trim(), name = String(row?.[1] ?? '').trim();
+    if (/^\d+$/.test(code) && name && !name.startsWith('※')) list.push({ code: pad2(code), name });
+  });
+  return list.sort((a, b) => +a.code - +b.code);
+}
+// 시간표에 적힌 과목명을 과목코드표/명단의 정식 이름으로 맞춘다 (띄어쓰기·로마숫자 차이 무시)
+function canonicalName(sub, codeList, rosterSubs) {
+  if (isSelf(sub)) return SELF;
+  const n = norm(sub);
+  const c = (codeList || []).find(x => norm(x.name) === n); if (c) return c.name;
+  const r = (rosterSubs || []).find(x => norm(x) === n); if (r) return r;
+  return sub;
+}
+
+/* ---------------------------- 이동반 계산 ---------------------------- */
+// 제외(전출·위탁 등) 학생을 빼고 '실제 인원' 기준으로 count명을 이동반으로 보낸다
+function splitClass(list, dir, count) {
+  const all = [...list].sort(byNum);
+  const act = all.filter(s => !s.excluded);
+  let moved, fixed;
+  if (dir === 'front') { moved = act.slice(0, count); fixed = act.slice(count); }
+  else { const k = Math.max(0, act.length - count); fixed = act.slice(0, k); moved = act.slice(k); }
+  return { moved, fixed, movedLabel: rangeLabel(moved), fixedLabel: rangeLabel(fixed) };
+}
+function rangeLabel(arr) {
+  if (!arr.length) return '없음';
+  const ns = arr.map(s => s.n), lo = Math.min(...ns), hi = Math.max(...ns), set = new Set(ns);
+  const gaps = []; for (let i = lo; i <= hi; i++) if (!set.has(i)) gaps.push(i);
+  return (lo === hi ? `${lo}번` : `${lo}~${hi}번`) + (gaps.length ? ` (${gaps.join(',')}번 제외)` : '');
+}
+
+/* ------------------------------ 샘플 데이터 ------------------------------ */
+function seeded(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function sampleSources() {
+  const rnd = seeded(20261029);
+  const names = ['김민수','이서준','박도윤','정하은','이지우','한민서','조서아','강도현','윤지호','장서윤','임주원','오하은','신예준','권나은','황지우','송시우','홍서연','배유준','백소율','전우진','손예린','서지호','남유진','문서준','안채원','유하린'];
+  const pick = (arr, k) => [...arr].sort(() => rnd() - 0.5).slice(0, k);
+  const sheets = [];
+  // 1학년: 공통과목은 명단 열이 없음(전원 응시), 정보 계열 2과목 중 택1
+  {
+    const subs = ['인공지능 기초', '알고리즘 설계'];
+    const rows = [['학년', '반', '번호', '학번', '이름', '성별', '비고', ...subs]];
+    for (let c = 1; c <= 3; c++) for (let n = 1; n <= 24; n++) {
+      if (c === 3 && n === 7) continue; // 결번
+      const choice = subs[Math.floor(rnd() * 2)];
+      rows.push([1, c, n, `1${String(c).padStart(2, '0')}${String(n).padStart(2, '0')}`, names[(n + c) % names.length], n % 2 ? '남' : '여', '', ...subs.map(s => s === choice ? '1' : '')]);
+    }
+    sheets.push({ name: '1학년', rows });
+  }
+  // 2학년
+  {
+    const core = ['화법과 언어', '미적분Ⅰ', '영어Ⅱ'];
+    const el = ['인공지능 수학','법과 사회','윤리와 사상','사회문제 탐구','전자기와 양자','화학 반응의 세계','세포와 물질대사','지구시스템과학','도시의 미래 탐구','정보과학','심화 중국어','심화 일본어'];
+    const subs = [...core, ...el];
+    const rows = [['학년', '반', '번호', '학번', '이름', '성별', '비고', ...subs]];
+    for (let c = 1; c <= 3; c++) for (let n = 1; n <= 25; n++) {
+      const chosen = new Set([...core, ...pick(el, 5)]);
+      const note = c === 2 && n === 5 ? '위탁' : '';
+      rows.push([2, c, n, `2${String(c).padStart(2, '0')}${String(n).padStart(2, '0')}`, names[(n + c * 3) % names.length], n % 2 ? '남' : '여', note, ...subs.map(s => chosen.has(s) ? '1' : '')]);
+    }
+    sheets.push({ name: '2학년', rows });
+  }
+  // 3학년
+  {
+    const subs = ['화법과 작문','언어와 매체','미적분','확률과 통계','심화 영어Ⅰ','진로 영어','물리학Ⅱ','세계사','생활과 윤리','세계지리','화학Ⅱ','정치와 법','생명과학Ⅱ','일본어 회화Ⅰ'];
+    const rows = [['학년', '반', '번호', '학번', '이름', '성별', '비고', ...subs]];
+    for (let c = 1; c <= 3; c++) for (let n = 1; n <= 26; n++) {
+      const chosen = new Set([...pick(subs.slice(0, 2), 1), ...pick(subs.slice(2, 4), 1), ...pick(subs.slice(4, 6), 1), ...pick(subs.slice(6), 3)]);
+      const note = (c === 1 && n === 12) ? '전출' : (c === 2 && n === 20) ? '자퇴' : '';
+      rows.push([3, c, n, `3${String(c).padStart(2, '0')}${String(n).padStart(2, '0')}`, names[(n + c * 5) % names.length], n % 2 ? '남' : '여', note, ...subs.map(s => chosen.has(s) ? '1' : '')]);
+    }
+    sheets.push({ name: '3학년', rows });
+  }
+  return [{ fileName: '샘플 데이터 (1~3학년, 9개 학급)', sheets }];
+}
+function sampleTT() {
+  const tt = emptyTT();
+  tt[1].cells = { '1-1': ['공통국어2'], '1-2': ['통합과학2'], '1-3': [SELF], '2-1': ['공통수학2'], '2-2': ['한국사2'], '2-3': [SELF], '3-1': ['공통영어2'], '3-2': ['통합사회2'], '3-3': ['인공지능 기초', '알고리즘 설계'] };
+  tt[2].cells = { '1-1': ['화법과 언어'], '1-2': ['법과 사회', '전자기와 양자'], '1-3': [SELF], '2-1': ['미적분Ⅰ'], '2-2': ['윤리와 사상', '화학 반응의 세계'], '2-3': ['심화 중국어', '심화 일본어'], '3-1': ['영어Ⅱ'], '3-2': ['세포와 물질대사', '사회문제 탐구'], '3-3': [SELF], '4-1': ['인공지능 수학'], '4-2': ['지구시스템과학', '도시의 미래 탐구'], '4-3': [SELF], '4-4': ['정보과학'] };
+  tt[2].periods = 4;
+  tt[3].cells = { '1-1': ['화법과 작문', '언어와 매체'], '1-2': ['물리학Ⅱ', '세계사'], '1-3': ['생활과 윤리'], '2-1': ['미적분', '확률과 통계'], '2-2': ['세계지리', '화학Ⅱ'], '2-3': [SELF], '3-1': ['심화 영어Ⅰ', '진로 영어'], '3-2': ['정치와 법', '생명과학Ⅱ'], '3-3': ['일본어 회화Ⅰ'] };
+  return tt;
+}
+
+/* --------------------------- 엑셀 공통 스타일 --------------------------- */
+const XL = {
+  border: { top: { style: 'thin', color: { argb: 'FF000000' } }, left: { style: 'thin', color: { argb: 'FF000000' } }, bottom: { style: 'thin', color: { argb: 'FF000000' } }, right: { style: 'thin', color: { argb: 'FF000000' } } },
+  fill: argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } }),
+  font: (size, bold, argb = 'FF000000') => ({ name: '맑은 고딕', size, bold: !!bold, color: { argb } }),
+};
+async function downloadWorkbook(wb, filename) {
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+const slotLabel = (labels, e) => `${labels[e.day] || `${e.day}일차`} ${e.period}교시`;
+
+/* ------------------ 응시 상태 문구 (엑셀·미리보기·인쇄 공용) ------------------ */
+// kind: self(자기주도학습) / none(미응시) / all(전원 응시) / some(번호 나열)
+function statusOf(g, e, df, takers) {
+  if (e.self) return { kind: 'self', text: SELF, count: 0 };
+  const t = takers(g, df, e.sub);
+  if (!t.length) return { kind: 'none', text: '미응시', count: 0 };
+  if (t.length === df.length) return { kind: 'all', text: `전원 응시(${t.length}명)`, count: t.length };
+  return { kind: 'some', text: `응시인원( ${t.length}명 ) = ${t.join(', ')}`, count: t.length };
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* ------------------------- 칠판 부착용 B4 레이아웃 -------------------------
+ * B4(JIS) 가로 364×257mm, 여백 좌우 3.8mm·상하 5.1mm
+ * → 인쇄 가능 영역 약 1010pt × 700pt. 하루 = 1장.
+ * 표 높이를 이 영역에 맞춰 행 높이를 정하고, 각 칸 글자가 들어가는 가장 큰 글씨 크기를 계산한다. */
+const CB = { pageWmm: 364, pageHmm: 257, padXmm: 3.8, padYmm: 5.1, w: [141, 303, 566], gapTop: 4, titleH: 62, gapMid: 8, headH: 50, titleF: 44, headF: 28, maxRow: 190, maxF: 44, minF: 12, lineH: 1.45 };
+CB.usable = (CB.pageHmm - 2 * CB.padYmm) / 25.4 * 72 * 0.96; // 4% 안전 여유
+CB.avail = CB.usable - CB.gapTop - CB.titleH - CB.gapMid - CB.headH;
+
+function charEm(ch) {
+  const c = ch.codePointAt(0);
+  if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x3130 && c <= 0x318F) || (c >= 0x2160 && c <= 0x217F)) return 1.0;
+  if (/[0-9]/.test(ch)) return 0.6;
+  if (ch === ' ') return 0.3;
+  if (/[,.]/.test(ch)) return 0.32;
+  if (/[()]/.test(ch)) return 0.4;
+  if (/[A-Z]/.test(ch)) return 0.72;
+  return 0.6;
+}
+const textWidth = (s, f) => { let w = 0; for (const ch of s) w += charEm(ch); return w * f; };
+function wrapCount(text, maxW, f) {
+  let lines = 0; const sp = textWidth(' ', f);
+  String(text).split('\n').forEach(para => {
+    lines++; let cur = 0;
+    para.split(' ').forEach(word => {
+      const ww = textWidth(word, f);
+      if (cur > 0 && cur + sp + ww <= maxW) { cur += sp + ww; return; }
+      if (cur > 0) lines++;
+      cur = ww;
+      while (cur > maxW) { lines++; cur -= maxW; }
+    });
+  });
+  return lines;
+}
+function fitFont(text, wPt, hPt, maxF, minF = CB.minF) {
+  for (let f = maxF; f > minF; f--) if (wrapCount(text, wPt - 22, f) * f * CB.lineH <= hPt - 6) return f;
+  return minF;
+}
+
+const subjectText = (e, one, br) => `${e.sub}${one ? ' ' : br}(${e.code || '코드없음'})`;
+// 한 학급·한 구분(고정/이동)의 일차별 페이지 데이터
+function chalkPagesFor(g, c, kind, ctx) {
+  const { exams, tt, classStudents, move, takers } = ctx;
+  const sp = splitClass(classStudents(g, c), move[g].dir, move[g].count);
+  const df = kind === '고정' ? sp.fixed : sp.moved;
+  const range = kind === '고정' ? sp.fixedLabel : sp.movedLabel;
+  const byDay = {};
+  exams[g].forEach(e => { (byDay[e.day] = byDay[e.day] || []).push(e); });
+  const days = Object.keys(byDay).map(Number).filter(d => byDay[d].some(e => !e.self)).sort((a, b) => a - b);
+  const pages = days.map(d => {
+    const rows = [...byDay[d]].sort((a, b) => a.period - b.period || (a.code || '99').localeCompare(b.code || '99'))
+      .map(e => ({ e, st: statusOf(g, e, df, takers) }));
+    rows.forEach((r, i) => {
+      r.first = i === 0 || rows[i - 1].e.period !== r.e.period;
+      if (r.first) { let k = i; while (k < rows.length && rows[k].e.period === r.e.period) k++; r.span = k - i; }
+    });
+    const rowH = Math.min(CB.maxRow, CB.avail / rows.length);
+    const minOf = arr => (arr.length ? Math.min(...arr) : CB.maxF);
+    const f3 = minOf(rows.filter(r => !r.e.self).map(r => fitFont(r.st.text, CB.w[2], rowH, CB.maxF)));
+    // 과목명 칸: '과목명↵(코드)' 두 줄과 '과목명 (코드)' 한 줄 중 글씨가 더 커지는 쪽을 고른다
+    const subFit = one => minOf(rows.map(r => r.e.self ? fitFont(SELF, CB.w[1] + CB.w[2], rowH, CB.maxF) : fitFont(subjectText(r.e, one, '\n'), CB.w[1], rowH, CB.maxF)));
+    const f2two = subFit(false), f2one = subFit(true);
+    const subOne = f2one > f2two, f2 = Math.max(f2one, f2two);
+    const f1 = minOf(rows.filter(r => r.first).map(r => fitFont(`${r.e.period}교시`, CB.w[0], rowH * r.span, 44)));
+    return { g, c, kind, day: d, label: tt[g].labels[d] || `${d}일차 시험 시간표`, head: `${g}학년 ${c}반 (${kind})`, rows, rowH, f1, f2, f3, subOne };
+  });
+  return { df, range, pages };
+}
+function chalkPageHTML(pg) {
+  const body = pg.rows.map(r => {
+    const p = r.first ? `<td class="blue c" rowspan="${r.span}" style="font-size:${pg.f1}pt">${r.e.period}교시</td>` : '';
+    if (r.e.self) return `<tr style="height:${pg.rowH}pt">${p}<td colspan="2" class="gray c" style="font-size:${pg.f2}pt">${SELF}</td></tr>`;
+    const cls = r.st.kind === 'none' ? 'red c' : r.st.kind === 'all' ? 'c' : 'l';
+    return `<tr style="height:${pg.rowH}pt">${p}<td class="blue c" style="font-size:${pg.f2}pt">${esc(subjectText(r.e, pg.subOne, '\n')).replace('\n', '<br>')}</td><td class="${cls}" style="font-size:${pg.f3}pt">${esc(r.st.text)}</td></tr>`;
+  }).join('');
+  return `<div class="b4"><div style="height:${CB.gapTop}pt"></div><div class="b4title" style="height:${CB.titleH}pt;font-size:${CB.titleF}pt">${esc(pg.label)}</div><div style="height:${CB.gapMid}pt"></div>`
+    + `<table class="cb"><colgroup><col style="width:13.96%"><col style="width:30%"><col style="width:56.04%"></colgroup>`
+    + `<thead><tr style="height:${CB.headH}pt"><th class="blue" style="font-size:${CB.headF}pt">교시</th><th class="blue" style="font-size:${CB.headF}pt">${esc(pg.head)}</th><th class="blue" style="font-size:${CB.headF}pt">응시학생 번호</th></tr></thead>`
+    + `<tbody>${body}</tbody></table></div>`;
+}
+// 출력 대상 → 페이지 목록 (classes: [[g,c],...], kinds: ['고정','이동'])
+function chalkAllPages(ctx, targets, kinds = ['고정', '이동']) {
+  const out = [];
+  targets.forEach(([g, c]) => kinds.forEach(kind => { const r = chalkPagesFor(g, c, kind, ctx); if (r.df.length) out.push(...r.pages); }));
+  return out;
+}
+
+/* [파일 2] 칠판 부착용 B4 가로 — 하루 1장 */
+function buildChalkboardWorkbook(ctx, targets) {
+  const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템'; wb.created = new Date();
+  const blue = XL.fill('FFBDD7EE'), gray = XL.fill('FFF1F5F9');
+  const chars = pt => Math.round(((pt * 4 / 3) - 5) / 7 * 100) / 100; // pt → 엑셀 열 너비
+  targets.forEach(([g, c]) => ['고정', '이동'].forEach(kind => {
+    const { df, pages } = chalkPagesFor(g, c, kind, ctx);
+    if (!df.length || !pages.length) return;
+    const ws = wb.addWorksheet(`${g}-${c}반_${kind}`.slice(0, 31), { pageSetup: { paperSize: 12, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, horizontalCentered: true, margins: { left: .15, right: .15, top: .2, bottom: .2, header: 0, footer: 0 } } });
+    CB.w.forEach((w, i) => { ws.getColumn(i + 1).width = chars(w); });
+    pages.forEach((pg, pi) => {
+      ws.addRow([]).height = CB.gapTop;
+      const tr = ws.addRow([pg.label, '', '']); tr.height = CB.titleH;
+      ws.mergeCells(tr.number, 1, tr.number, 3);
+      const tc = ws.getCell(tr.number, 1); tc.font = XL.font(CB.titleF, true); tc.alignment = { vertical: 'middle', horizontal: 'center' };
+      ws.addRow([]).height = CB.gapMid;
+      const hr = ws.addRow(['교시', pg.head, '응시학생 번호']); hr.height = CB.headH;
+      [1, 2, 3].forEach(i => { const x = hr.getCell(i); x.fill = blue; x.border = XL.border; x.font = XL.font(CB.headF, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; });
+      pg.rows.forEach(r => {
+        const row = ws.addRow([r.first ? `${r.e.period}교시` : '', r.e.self ? SELF : subjectText(r.e, pg.subOne, '\r\n'), r.e.self ? '' : r.st.text]);
+        row.height = pg.rowH; r.rowNum = row.number;
+        const a = row.getCell(1); a.fill = blue; a.border = XL.border; a.font = XL.font(pg.f1, true); a.alignment = { vertical: 'middle', horizontal: 'center' };
+        const b = row.getCell(2); b.border = XL.border; b.font = XL.font(pg.f2, true, r.e.self ? 'FF64748B' : 'FF000000'); b.fill = r.e.self ? gray : blue; b.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        const x = row.getCell(3); x.border = XL.border;
+        if (r.e.self) { x.fill = gray; ws.mergeCells(row.number, 2, row.number, 3); }
+        else {
+          x.font = XL.font(pg.f3, true, r.st.kind === 'none' ? 'FFE00000' : 'FF000000');
+          x.alignment = r.st.kind === 'some' ? { vertical: 'middle', horizontal: 'left', indent: 1, wrapText: true } : { vertical: 'middle', horizontal: 'center', wrapText: true };
+        }
+      });
+      pg.rows.forEach(r => { if (r.first && r.span > 1) ws.mergeCells(r.rowNum, 1, r.rowNum + r.span - 1, 1); });
+      if (pi < pages.length - 1) ws.lastRow.addPageBreak();
+    });
+  }));
+  return wb;
+}
+
+/* ----------------------- 과목별 응시현황 (공용 데이터) ----------------------- */
+function overviewData(g, classes, ctx) {
+  const { exams, classStudents, move, takers } = ctx;
+  const list = exams[g];
+  const sums = list.map(() => 0);
+  const rows = [];
+  classes.forEach(c => {
+    const sp = splitClass(classStudents(g, c), move[g].dir, move[g].count);
+    [['이동반', sp.movedLabel, sp.moved], ['고정반', sp.fixedLabel, sp.fixed]].forEach(([lab, range, df]) => {
+      const cells = list.map((e, i) => { const st = statusOf(g, e, df, takers); sums[i] += st.count; return st; });
+      rows.push({ c, lab, range, cells });
+    });
+  });
+  return { list, rows, sums };
+}
+function overviewHTML(g, classes, ctx) {
+  const { tt } = ctx;
+  const { list, rows, sums } = overviewData(g, classes, ctx);
+  if (!list.length || !classes.length) return '';
+  const fs = 10;
+  const head1 = list.map(e => `<th class="peach">${esc(slotLabel(tt[g].labels, e))}</th>`).join('');
+  const head2 = list.map(e => e.self ? `<th class="gray">${SELF}</th>` : `<th class="navy">${esc(e.sub)}<br><span style="font-weight:400">(${esc(e.code || '코드없음')})</span></th>`).join('');
+  const body = rows.map(r => `<tr><td class="peach c b">${r.lab}<br><span style="font-weight:400;font-size:.9em">(${esc(r.range)})</span></td><td class="lblue c b">${r.c}반</td>${r.cells.map(st =>
+    st.kind === 'self' ? `<td class="gray c">${SELF}</td>` : st.kind === 'none' ? `<td class="peach red c b">미응시</td>` : st.kind === 'all' ? `<td class="c b">${esc(st.text)}</td>` : `<td><b>응시인원( ${st.count}명 ) =</b> ${esc(st.text.split('= ')[1])}</td>`).join('')}</tr>`).join('');
+  const sum = `<tr class="sum"><td colspan="2" class="lgray c b">응시 인원 합계</td>${list.map((e, i) => e.self ? '<td class="gray c">-</td>' : `<td class="c b">${sums[i]}명</td>`).join('')}</tr>`;
+  return `<div class="ovw" style="font-size:${fs}pt"><div class="ovtitle">${g}학년 과목별 응시현황 <span>(${classes.map(c => c + '반').join(', ')})</span></div>`
+    + `<table class="ovt" style="width:${Math.max(348, list.length * 30 + 45)}mm"><colgroup><col style="width:30mm"><col style="width:13mm"></colgroup><thead><tr><th rowspan="2" class="lgray">일시/교시</th><th rowspan="2" class="lgray">반</th>${head1}</tr><tr>${head2}</tr></thead><tbody>${body}${sum}</tbody></table></div>`;
+}
+function confirmHTML(g, c, ctx) {
+  const { exams, classStudents, takers } = ctx;
+  const subs = exams[g].filter(e => !e.self);
+  const list = classStudents(g, c).filter(s => !s.excluded).sort(byNum);
+  const fs = list.length > 30 ? 9 : 10;
+  return `<div class="cfw" style="font-size:${fs}pt"><div class="cftitle">${g}학년 ${c}반 정기시험 선택과목 응시 확인표</div>`
+    + `<table class="cft"><colgroup><col style="width:8%"><col style="width:15%"><col><col style="width:14%"></colgroup><thead><tr><th>번호</th><th>이름</th><th>응시하는 선택과목</th><th>확인(서명)</th></tr></thead><tbody>`
+    + list.map(s => { const mine = [...new Set(subs.filter(e => takers(g, [s], e.sub).length).map(e => e.sub))]; return `<tr><td class="c">${s.n}</td><td class="c">${esc(s.name)}</td><td>${esc(mine.length ? mine.join(', ') : '해당 없음(미응시)')}</td><td></td></tr>`; }).join('')
+    + `</tbody></table></div>`;
+}
+
+/* [파일 1] 학년별 과목별 응시현황(+합계) + 반별 응시확인표 */
+function buildOverviewWorkbook(ctx) {
+  const { selected, exams, tt, classStudents, takers } = ctx;
+  const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템'; wb.created = new Date();
+  const lgray = XL.fill('FFF2F2F2'), peach = XL.fill('FFFCE4D6'), navy = XL.fill('FF41719C'), lblue = XL.fill('FFBDD7EE'), gray = XL.fill('FFF1F5F9'), white = XL.fill('FFFFFFFF');
+  GRADES.forEach(g => {
+    const classes = selected[g];
+    const { list, rows, sums } = overviewData(g, classes, ctx);
+    if (!list.some(e => !e.self) || !classes.length) return;
+    const ws = wb.addWorksheet(`${g}학년_응시현황`, { pageSetup: { paperSize: 12, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: .3, right: .3, top: .4, bottom: .4, header: .1, footer: .1 } } });
+    ws.getColumn(1).width = 22; ws.getColumn(2).width = 8;
+    list.forEach((e, i) => { ws.getColumn(i + 3).width = e.self ? 16 : 32; });
+    const r1 = ws.addRow(['일시/교시', '반', ...list.map(e => slotLabel(tt[g].labels, e))]); r1.height = 34;
+    const r2 = ws.addRow(['일시/교시', '반', ...list.map(e => e.self ? SELF : `${e.sub}\r\n(${e.code || '코드없음'})`)]); r2.height = 48;
+    ws.mergeCells('A1:A2'); ws.mergeCells('B1:B2');
+    [1, 2].forEach(c => [1, 2].forEach(r => { const x = ws.getCell(r, c); x.fill = lgray; x.border = XL.border; x.font = XL.font(11, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; }));
+    list.forEach((e, i) => {
+      const a = r1.getCell(i + 3); a.fill = peach; a.border = XL.border; a.font = XL.font(10.5, true); a.alignment = { vertical: 'top', horizontal: 'center', wrapText: true };
+      const b = r2.getCell(i + 3); b.fill = e.self ? gray : navy; b.border = XL.border; b.font = XL.font(10.5, true, e.self ? 'FF64748B' : 'FFFFFFFF'); b.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+    });
+    rows.forEach(r => {
+      const row = ws.addRow([`${r.lab}\n(${r.range})`, `${r.c}반`, ...r.cells.map(st => st.text)]); row.height = 44;
+      const a = row.getCell(1); a.fill = peach; a.border = XL.border; a.font = XL.font(10, true); a.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      const b = row.getCell(2); b.fill = lblue; b.border = XL.border; b.font = XL.font(11, true); b.alignment = { vertical: 'middle', horizontal: 'center' };
+      r.cells.forEach((st, i) => {
+        const x = row.getCell(i + 3); x.border = XL.border;
+        if (st.kind === 'self') { x.fill = gray; x.font = XL.font(10, false, 'FF64748B'); x.alignment = { vertical: 'middle', horizontal: 'center' }; }
+        else if (st.kind === 'none') { x.fill = peach; x.font = XL.font(10, true, 'FFFF0000'); x.alignment = { vertical: 'middle', horizontal: 'center' }; }
+        else if (st.kind === 'all') { x.fill = white; x.font = XL.font(10.5, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; }
+        else { x.fill = white; x.font = XL.font(10, false); x.alignment = { vertical: 'middle', horizontal: 'left', indent: 1, wrapText: true }; }
+      });
+    });
+    const sr = ws.addRow(['응시 인원 합계', '', ...list.map((e, i) => e.self ? '-' : `${sums[i]}명`)]); sr.height = 30;
+    ws.mergeCells(sr.number, 1, sr.number, 2);
+    for (let i = 1; i <= list.length + 2; i++) {
+      const x = sr.getCell(i); x.border = { ...XL.border, top: { style: 'double', color: { argb: 'FF000000' } } };
+      x.fill = i <= 2 ? lgray : list[i - 3].self ? gray : XL.fill('FFFFF7D6'); x.font = XL.font(11, true); x.alignment = { vertical: 'middle', horizontal: 'center' };
+    }
+  });
+  // 반별 응시확인표 (A4 세로, 서명칸)
+  GRADES.forEach(g => {
+    const subs = exams[g].filter(e => !e.self);
+    selected[g].forEach(c => {
+      const list = classStudents(g, c).filter(s => !s.excluded).sort(byNum);
+      if (!list.length) return;
+      const nCount = list.length, rowH = nCount > 30 ? 21.5 : nCount > 25 ? 22.5 : 24, fs = nCount > 30 ? 9 : 9.5;
+      const ws = wb.addWorksheet(`${g}-${c}반_응시확인`, { pageSetup: { paperSize: 9, orientation: 'portrait', horizontalCentered: true, fitToPage: true, fitToWidth: 1, fitToHeight: 1, margins: { left: .2, right: .2, top: .25, bottom: .25, header: 0, footer: 0 } } });
+      ws.getColumn(1).width = 6; ws.getColumn(2).width = 11; ws.getColumn(3).width = 88; ws.getColumn(4).width = 10;
+      const t = ws.addRow([`${g}학년 ${c}반 정기시험 선택과목 응시 확인표`, '', '', '']); t.height = 32;
+      ws.mergeCells('A1:D1'); const tc = ws.getCell('A1'); tc.font = XL.font(16, true); tc.alignment = { vertical: 'middle', horizontal: 'center' };
+      const hd = ws.addRow(['번호', '이름', '응시하는 선택과목', '확인(서명)']); hd.height = 24;
+      [1, 2, 3, 4].forEach(i => { const x = hd.getCell(i); x.fill = XL.fill('FFE7E6E6'); x.border = XL.border; x.font = XL.font(10.5, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; });
+      list.forEach(s => {
+        const mine = [...new Set(subs.filter(e => takers(g, [s], e.sub).length).map(e => e.sub))];
+        const text = mine.length ? mine.join(', ') : '해당 없음(미응시)';
+        const row = ws.addRow([s.n, s.name, text, '']); row.height = text.length > 78 ? 26 : rowH;
+        [1, 2, 3, 4].forEach(i => {
+          const x = row.getCell(i); x.border = XL.border; x.font = XL.font(fs, false);
+          x.alignment = i === 3 ? { vertical: 'middle', horizontal: 'left', indent: 1, wrapText: true } : { vertical: 'middle', horizontal: 'center', wrapText: i === 2 };
+        });
+      });
+    });
+  });
+  return wb;
+}
+
+/* ------------------------- 일반 사용자용 파일 만들기 -------------------------
+ * 지금 화면의 프로그램 코드 + 결과 데이터를 하나의 HTML로 묶는다.
+ * 그 파일을 열면 관리 기능 없이 미리보기·인쇄·칠판 엑셀 다운로드만 보인다. */
+function buildViewerHTML(payload) {
+  const head = [...document.querySelectorAll('head link[rel=preconnect], head link[rel=stylesheet], head script[src]')].map(e => e.outerHTML).join('\n');
+  const base = document.getElementById('base-style').outerHTML;
+  const app = document.getElementById('app').textContent;
+  const data = JSON.stringify(payload).replace(/</g, '\\u003c');
+  const S = 'script';
+  return `<!doctype html>\n<html lang="ko">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>정기시험 출력물 (일반 사용자용)</title>\n${head}\n${base}\n</head>\n<body>\n<div id="root"></div>\n<${S}>window.__VIEWER__ = ${data};</${S}>\n<${S} id="app">${app}</${S}>\n</body>\n</html>\n`;
+}
+const stamp = d => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}_${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}`;
+
+/* ------------------------------ 웹 인쇄 ------------------------------ */
+const PRINT_CSS = `
+table{font-size:inherit}
+.b4{width:364mm;height:256.5mm;box-sizing:border-box;padding:5.1mm 3.8mm;background:#fff;color:#000;font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;overflow:hidden}
+.b4title{display:flex;align-items:center;justify-content:center;font-weight:900;line-height:1}
+.cb{width:100%;border-collapse:collapse;table-layout:fixed}
+.cb th,.cb td{border:1.3px solid #000;font-weight:700;line-height:${CB.lineH};padding:0 6pt;word-break:keep-all;overflow-wrap:anywhere;overflow:hidden;vertical-align:middle}
+.blue{background:#BDD7EE}.gray{background:#F1F5F9;color:#64748B}.red{color:#E00000}.c{text-align:center}.l{text-align:left;padding-left:12pt!important}.b{font-weight:700}
+.peach{background:#FCE4D6}.navy{background:#41719C;color:#fff}.lgray{background:#F2F2F2}.lblue{background:#BDD7EE}
+.ovw{font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;color:#000;background:#fff}
+.ovtitle{font-size:1.5em;font-weight:900;margin:0 0 6pt}.ovtitle span{font-size:.7em;font-weight:500;color:#475569}
+.ovt{width:100%;border-collapse:collapse;table-layout:fixed}
+.ovt th,.ovt td{border:1px solid #444;padding:3pt 4pt;vertical-align:middle;word-break:keep-all;overflow-wrap:anywhere;line-height:1.35}
+.ovt th{font-weight:700;text-align:center}.ovt tr.sum td{border-top:2.5px double #000;background:#FFF7D6}.ovt tr.sum td.gray{background:#F1F5F9}.ovt tr.sum td.lgray{background:#F2F2F2}
+.cfw{font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;color:#000;background:#fff}
+.cftitle{font-size:16pt;font-weight:900;text-align:center;margin:0 0 8pt}
+.cft{width:100%;border-collapse:collapse;table-layout:fixed}
+.cft th,.cft td{border:1px solid #444;padding:2.5pt 5pt;height:17pt;vertical-align:middle}
+.cft th{background:#E7E6E6;font-weight:700}
+`;
+const PAGE_CSS = {
+  b4: '@page{size:364mm 257mm;margin:0}',
+  b4ov: '@page{size:364mm 257mm;margin:8mm}',
+  a4: '@page{size:210mm 297mm;margin:10mm}',
+};
+// 한 장에 맞출 인쇄 가능 영역(mm). 내용이 넘치면 인쇄 직전에 실제 크기를 재서 자동 축소한다.
+const PAGE_FIT = { b4: null, b4ov: { w: 348, h: 241 }, a4: { w: 190, h: 277 } };
+function printPages(pages, pageKey) {
+  if (!pages.length) { alert('인쇄할 내용이 없습니다.'); return; }
+  const fit = PAGE_FIT[pageKey];
+  if (fit) pages = pages.map(h => `<div class="fit" style="width:${fit.w}mm">${h}</div>`);
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('aria-hidden', 'true');
+  iframe.style.cssText = 'position:fixed;left:-20000px;top:0;width:1600px;height:1200px;border:0';
+  document.body.appendChild(iframe);
+  const doc = iframe.contentDocument;
+  doc.open();
+  doc.write(`<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>정기시험 출력물</title><style>${PRINT_CSS}${PAGE_CSS[pageKey]}
+html,body{margin:0;padding:0;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.pg{break-after:page;page-break-after:always}.pg:last-child{break-after:auto;page-break-after:auto}</style></head>
+<body>${pages.map(h => `<div class="pg">${h}</div>`).join('')}</body></html>`);
+  doc.close();
+  window.__lastPrintDoc = doc; // 테스트용
+  setTimeout(() => {
+    if (fit) { // 글꼴·배치가 끝난 뒤 실제 크기를 재서 축소 (3% 여유)
+      const px = 96 / 25.4;
+      const W = fit.w * px, H = fit.h * px * 0.97;
+      doc.querySelectorAll('.fit').forEach(el => {
+        let z = 1;
+        for (let i = 0; i < 8; i++) { // 축소하면 줄바꿈이 달라질 수 있어 실제 크기를 다시 재며 반복
+          const r = el.getBoundingClientRect(), w = Math.max(r.width, el.scrollWidth * z);
+          if (r.height <= H && w <= W + 1) break;
+          z = Math.floor(z * Math.min(H / r.height, W / w) * 0.99 * 1000) / 1000;
+          el.style.zoom = String(z);
+        }
+      });
+    }
+    try { iframe.contentWindow.focus(); iframe.contentWindow.print(); }
+    catch (e) { alert('인쇄 창을 열 수 없습니다: ' + e.message); }
+    setTimeout(() => iframe.remove(), 60000);
+  }, 400);
+}
+
+/* 표준 양식: 학년별 시간표 + 과목코드 (현재 입력값 포함) */
+function buildTimetableTemplate(tt, codes) {
+  const wb = new ExcelJS.Workbook();
+  const note = "※ 1행: 날짜를 '6월 29일 월요일' 형식으로 입력하세요 (그대로 출력됩니다).\n※ 과목명은 명단 엑셀의 열 이름과 동일하게 입력 (띄어쓰기 달라도 자동 인식).\n※ 같은 교시에 과목이 2개면 슬래시(/)로 구분  예) 물리학Ⅱ/세계사\n※ 시험 없이 자습하는 교시는 '자기주도학습'으로 입력 (과목코드 없음).\n※ 해당 일차·교시에 과목이 없으면 빈칸으로 두세요.";
+  GRADES.forEach(g => {
+    const t = tt[g]; const ws = wb.addWorksheet(`${g}학년 시간표`);
+    const days = Array.from({ length: t.days }, (_, i) => i + 1);
+    ws.addRow(['날짜 입력 →', ...days.map(d => t.labels[d] || '')]);
+    ws.addRow(['교시 | 일차', ...days.map(d => `${d}일차`)]);
+    for (let p = 1; p <= Math.max(4, t.periods); p++) ws.addRow([`${p}교시`, ...days.map(d => (t.cells[`${d}-${p}`] || []).join('/'))]);
+    ws.addRow([]);
+    const nr = ws.addRow([note]); ws.mergeCells(nr.number, 1, nr.number, days.length + 1); nr.height = 90;
+    nr.getCell(1).alignment = { wrapText: true, vertical: 'top' }; nr.getCell(1).font = { size: 9, color: { argb: 'FF475569' } };
+    ws.getColumn(1).width = 14; days.forEach((_, i) => { ws.getColumn(i + 2).width = 22; });
+    [1, 2].forEach(r => ws.getRow(r).eachCell(x => { x.font = { bold: true }; x.fill = XL.fill(r === 1 ? 'FFFCE4D6' : 'FFE7E6E6'); x.border = XL.border; x.alignment = { horizontal: 'center' }; }));
+    for (let r = 3; r < 3 + Math.max(4, t.periods); r++) for (let c = 1; c <= days.length + 1; c++) { const x = ws.getCell(r, c); x.border = XL.border; x.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; }
+  });
+  GRADES.forEach(g => {
+    const ws = wb.addWorksheet(`${g}학년 과목코드`);
+    ws.addRow(['코드', '과목명']);
+    ws.addRow(['※ 코드(숫자)와 과목명을 입력하세요. 과목명은 명단 엑셀과 동일하게 (띄어쓰기 달라도 자동 인식)', '']);
+    (codes[g] || []).forEach(x => ws.addRow([x.code, x.name]));
+    ws.getColumn(1).width = 10; ws.getColumn(2).width = 30; ws.getColumn(1).numFmt = '@';
+    ws.getRow(1).eachCell(x => { x.font = { bold: true }; x.fill = XL.fill('FFE7E6E6'); });
+  });
+  return wb;
+}
+function buildRosterTemplate(codes) {
+  const wb = new ExcelJS.Workbook();
+  GRADES.forEach(g => {
+    const subs = (codes[g] || []).map(x => x.name);
+    const ws = wb.addWorksheet(`${g}학년`);
+    ws.addRow(['학년', '반', '번호', '학번', '이름', '성별', '비고', ...subs]);
+    ws.addRow([g, 1, 1, `${g}0101`, '홍길동 (예시)', '남', '', ...subs.map((_, i) => i < 3 ? '1' : '')]);
+    ws.addRow([g, 1, 2, `${g}0102`, '김철수 (예시)', '남', '전출', ...subs.map(() => '')]);
+    ws.addRow([g, 1, 3, `${g}0103`, '이영희 (예시)', '여', '', ...subs.map((_, i) => i >= 3 && i < 6 ? '1' : '')]);
+    ws.getRow(1).eachCell(x => { x.font = { bold: true }; x.fill = XL.fill('FFE7E6E6'); x.alignment = { horizontal: 'center', wrapText: true }; });
+    [8, 6, 6, 9, 16, 6, 10].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+    subs.forEach((_, i) => { ws.getColumn(i + 8).width = 12; });
+  });
+  return wb;
+}
+
+/* ------------------------------ 작은 컴포넌트 ------------------------------ */
+const Card = ({ step, title, right, children }) => html`
+  <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+    <div className="flex items-center justify-between gap-2 mb-3">
+      <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+        <span className="bg-indigo-600 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">${step}</span>${title}
+      </h2>${right}
+    </div>${children}
+  </section>`;
+const Seg = ({ value, options, onChange, size = 'sm' }) => html`
+  <div className="inline-flex rounded-lg border border-slate-300 overflow-hidden">
+    ${options.map(([v, label]) => html`<button type="button" key=${v} onClick=${() => onChange(v)}
+      className=${`${size === 'xs' ? 'px-2 py-1 text-[11px]' : 'px-3 py-1.5 text-xs'} font-semibold transition ${value === v ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}>${label}</button>`)}
+  </div>`;
+const btn = 'text-xs font-semibold py-2.5 px-3 rounded-lg shadow-sm transition flex items-center justify-center gap-1.5 text-center cursor-pointer';
+
+/* ================================ 메인 앱 ================================ */
+function App() {
+  const [sourceLabel, setSourceLabel] = useState('');
+  const sourcesRef = useRef([]);
+  const [keywords, setKeywords] = useState(DEFAULT_KEYWORDS);
+  const [roster, setRoster] = useState({ students: [], subjectsByGrade: { 1: [], 2: [], 3: [] }, sheets: [], dup: 0, skipped: 0, unknownGrade: 0 });
+  const [move, setMove] = useState({ 1: { ...DEFAULT_MOVE }, 2: { ...DEFAULT_MOVE }, 3: { ...DEFAULT_MOVE } });
+  const [sel, setSel] = useState({});
+  const [tt, setTT] = useState(emptyTT);
+  const [codes, setCodes] = useState(defaultCodes);
+  const [msg, setMsg] = useState({ text: '준비되었습니다.', type: 'info' });
+  const [busy, setBusy] = useState(false);
+  // 화면 상태
+  const [tab, setTab] = useState(VIEWER ? 'chalkboard' : 'timetable');
+  const [selGrade, setSelGrade] = useState(3);
+  const [ttGrade, setTTGrade] = useState(3);
+  const [pv, setPv] = useState({ g: 3, c: 1, kind: '고정', day: 1, zoom: 'fit' });
+  const [ov, setOv] = useState({ g: 3, c: 'all' });
+  const [cf, setCf] = useState({ g: 3, c: 1 });
+
+  const say = (text, type = 'success') => setMsg({ text, type });
+
+  /* ---------- 명단 적용 ---------- */
+  const applySources = (sources, label, kw = keywords, keepSel = null) => {
+    sourcesRef.current = sources;
+    const r = buildRoster(sources, parseKeywords(kw));
+    if (!r.students.length) { say('명단에서 학생을 찾지 못했습니다. 이름·반·번호(또는 학번) 열이 있는지 확인하세요.', 'error'); return null; }
+    setRoster(r); setSourceLabel(label);
+    const keys = [...new Set(r.students.map(s => clsKey(s.g, s.c)))];
+    setSel(prev => { const base = keepSel || prev; const next = {}; keys.forEach(k => { next[k] = base[k] !== undefined ? base[k] : true; }); return next; });
+    const gs = [...new Set(r.students.map(s => s.g))].sort();
+    if (!gs.includes(selGrade)) setSelGrade(gs[gs.length - 1]);
+    if (!gs.includes(pv.g)) setPv(p => ({ ...p, g: gs[gs.length - 1], c: Math.min(...r.students.filter(s => s.g === gs[gs.length - 1]).map(s => s.c)) }));
+    const ex = r.students.filter(s => s.excluded).length;
+    say(`✓ 명단 로드 완료: ${gs.map(g => `${g}학년 ${r.students.filter(s => s.g === g && !s.excluded).length}명`).join(' · ')}${ex ? ` (전출·위탁 등 ${ex}명 자동 제외)` : ''}${r.unknownGrade ? ` · 학년을 알 수 없는 ${r.unknownGrade}명 제외` : ''}`);
+    return r;
+  };
+
+  const loadSample = () => {
+    applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)');
+    setTT(sampleTT()); setCodes(defaultCodes());
+    say('샘플 명단(1~3학년)과 샘플 시간표가 로드되었습니다. 실제 명단·시간표 파일을 업로드하세요.', 'info');
+  };
+
+  // 일반 사용자용: 파일에 들어 있는 결과 데이터로 시작
+  const loadViewer = () => {
+    const students = VIEWER.students.map(s => ({ ...s, takenNorm: new Set(s.taken.map(norm)) }));
+    setRoster({ students, subjectsByGrade: VIEWER.subjectsByGrade, sheets: [], dup: 0, skipped: 0, unknownGrade: 0 });
+    setTT(VIEWER.tt); setCodes(VIEWER.codes); setMove(VIEWER.move); setSel(VIEWER.sel);
+    setSourceLabel(VIEWER.label);
+    const gs = [...new Set(students.map(s => s.g))].sort();
+    const g0 = gs[0] || 1, c0 = Math.min(...students.filter(s => s.g === g0).map(s => s.c));
+    setPv(p => ({ ...p, g: g0, c: c0 })); setOv({ g: g0, c: 'all' }); setCf({ g: g0, c: c0 });
+    say(`일반 사용자용 화면입니다. 학년·학급을 골라 미리보기 후 인쇄하거나 칠판 부착물 엑셀을 내려받으세요. (자료 기준: ${VIEWER.createdAt})`, 'info');
+  };
+  // 관리자: 결과 데이터를 담은 일반 사용자용 HTML 파일 만들기
+  const makeViewerFile = () => {
+    if (!guard()) return;
+    const now = new Date();
+    const payload = {
+      v: 1, createdAt: now.toLocaleString('ko-KR'), label: `${sourceLabel} (${now.toLocaleDateString('ko-KR')} 기준)`,
+      students: students.map(({ g, c, n, id, name, gender, taken, excluded, reason }) => ({ g, c, n, id, name, gender, taken, excluded, reason })),
+      subjectsByGrade: roster.subjectsByGrade, tt, codes, move, sel,
+    };
+    const blob = new Blob([buildViewerHTML(payload)], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = `정기시험_출력물_일반사용자용_${stamp(now)}.html`;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    say('📤 일반 사용자용 파일을 만들었습니다. 이 파일을 선생님들께 배포하세요. (학생 이름이 들어 있으니 교내에서만 공유하세요)');
+  };
+
+  // 시작 시: 저장된 설정 복원 + 샘플 명단
+  useEffect(() => {
+    if (VIEWER) { loadViewer(); return; }
+    let cfg = null;
+    try { const raw = safeStorage.get(CONFIG_KEY); if (raw) cfg = JSON.parse(raw); } catch (e) { cfg = null; }
+    if (cfg) {
+      if (cfg.keywords) setKeywords(cfg.keywords);
+      if (cfg.move) setMove(m => ({ ...m, ...cfg.move }));
+      if (cfg.tt) setTT(t => ({ ...t, ...cfg.tt }));
+      if (cfg.codes) setCodes(c => ({ ...c, ...cfg.codes }));
+      applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)', cfg.keywords || DEFAULT_KEYWORDS, cfg.sel || {});
+      say('저장된 설정(시간표·과목코드·이동반·학급 선택)을 불러왔습니다. 명단 파일을 업로드하세요.', 'info');
+    } else loadSample();
+  }, []);
+
+  const readFile = file => new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = e => { try { const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' }); res({ fileName: file.name, wb }); } catch (err) { rej(err); } };
+    fr.onerror = rej; fr.readAsArrayBuffer(file);
+  });
+  const sheetRows = (wb, name) => XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: '', raw: false });
+
+  const onRosterUpload = async e => {
+    const files = [...(e.target.files || [])]; e.target.value = '';
+    if (!files.length) return;
+    try {
+      const books = await Promise.all(files.map(readFile));
+      const sources = books.map(b => ({ fileName: b.fileName, sheets: b.wb.SheetNames.map(n => ({ name: n, rows: sheetRows(b.wb, n) })) }));
+      applySources(sources, files.map(f => f.name).join(', '));
+    } catch (err) { say(`학생 명단 파일 읽기 오류: ${err.message}`, 'error'); }
+  };
+  const reapplyKeywords = () => { if (sourcesRef.current.length) applySources(sourcesRef.current, sourceLabel, keywords, sel); };
+
+  const onTTUpload = async e => {
+    const file = e.target.files?.[0]; e.target.value = '';
+    if (!file) return;
+    try {
+      const { wb } = await readFile(file);
+      const nextTT = deepClone(tt), nextCodes = deepClone(codes);
+      const done = [];
+      const legacy = { tt: null, codes: null };
+      wb.SheetNames.forEach(name => {
+        const g = gradeHint(name), rows = sheetRows(wb, name);
+        if (/코드/.test(name)) { const list = parseCodeSheet(rows); if (!list.length) return; if (g) { nextCodes[g] = list; done.push(`${g}학년 과목코드 ${list.length}개`); } else legacy.codes = list; }
+        else if (/시간표/.test(name)) { const t = parseTTSheet(rows); if (!t) return; if (g) { nextTT[g] = t; done.push(`${g}학년 시간표`); } else legacy.tt = t; }
+      });
+      // 예전 양식(학년 구분 없는 '시간표'·'과목코드' 시트)은 현재 선택된 학년 탭에 적용
+      if (legacy.codes) { nextCodes[ttGrade] = legacy.codes; done.push(`${ttGrade}학년 과목코드(구양식)`); }
+      if (legacy.tt) { nextTT[ttGrade] = legacy.tt; done.push(`${ttGrade}학년 시간표(구양식)`); }
+      if (!done.length) { say("시간표 파일에서 '1학년 시간표', '1학년 과목코드' 같은 시트를 찾지 못했습니다.", 'error'); return; }
+      // 과목명 정식화
+      GRADES.forEach(g => {
+        const cells = {};
+        Object.entries(nextTT[g].cells).forEach(([k, subs]) => { cells[k] = [...new Set(subs.map(s => canonicalName(s, nextCodes[g], roster.subjectsByGrade[g])))]; });
+        nextTT[g].cells = cells;
+      });
+      setTT(nextTT); setCodes(nextCodes); setTab('timetable');
+      say(`📅 시간표 파일 적용 완료: ${done.join(', ')}`);
+    } catch (err) { say(`시간표 파일 읽기 오류: ${err.message}`, 'error'); }
+  };
+
+  const saveConfig = () => {
+    const ok = safeStorage.set(CONFIG_KEY, JSON.stringify({ v: 8, keywords, move, sel, tt, codes }));
+    say(ok ? '💾 설정(시간표·과목코드·이동반·학급 선택·제외 키워드)이 이 브라우저에 저장되었습니다.' : '이 브라우저에서는 설정을 저장할 수 없습니다.', ok ? 'success' : 'error');
+  };
+
+  /* ---------- 파생 데이터 ---------- */
+  const students = roster.students;
+  const classesByGrade = useMemo(() => {
+    const o = { 1: [], 2: [], 3: [] };
+    students.forEach(s => { if (!o[s.g].includes(s.c)) o[s.g].push(s.c); });
+    GRADES.forEach(g => o[g].sort((a, b) => a - b)); return o;
+  }, [students]);
+  const presentGrades = GRADES.filter(g => classesByGrade[g].length);
+  const classStudents = (g, c) => students.filter(s => s.g === g && s.c === c);
+  const selected = useMemo(() => Object.fromEntries(GRADES.map(g => [g, classesByGrade[g].filter(c => sel[clsKey(g, c)])])), [classesByGrade, sel]);
+  const rosterNorm = useMemo(() => Object.fromEntries(GRADES.map(g => [g, new Set(roster.subjectsByGrade[g].map(norm))])), [roster]);
+  const codeOf = (g, sub) => (codes[g] || []).find(x => norm(x.name) === norm(sub))?.code || '';
+  const isCommon = (g, sub) => !isSelf(sub) && !rosterNorm[g].has(norm(sub));
+  const exams = useMemo(() => {
+    const o = {};
+    GRADES.forEach(g => {
+      const t = tt[g], list = [];
+      Object.entries(t.cells).forEach(([k, subs]) => {
+        const [d, p] = k.split('-').map(Number);
+        if (d > t.days || p > t.periods) return;
+        subs.forEach(sub => list.push({ sub, day: d, period: p, code: isSelf(sub) ? '' : codeOf(g, sub), self: isSelf(sub), common: isCommon(g, sub) }));
+      });
+      list.sort((a, b) => a.day - b.day || a.period - b.period || (a.code || '99').localeCompare(b.code || '99'));
+      o[g] = list;
+    });
+    return o;
+  }, [tt, codes, rosterNorm]);
+  const takers = (g, df, sub) => {
+    const common = isCommon(g, sub), n = norm(sub);
+    return df.filter(s => common || s.takenNorm.has(n)).map(s => s.n).sort((a, b) => a - b);
+  };
+  const ctx = { selected, exams, tt, classStudents, move, takers };
+
+  /* ---------- 출력 ---------- */
+  const guard = () => {
+    if (!students.length) { alert('학생 데이터가 없습니다.'); return false; }
+    if (!GRADES.some(g => selected[g].length)) { alert('대상 학급을 최소 1개 이상 선택해주세요.'); return false; }
+    if (!GRADES.some(g => selected[g].length && exams[g].some(e => !e.self))) { alert('선택한 학년의 시험 시간표에 시험 과목이 없습니다. 시간표를 업로드하거나 [시간표 확인·수정] 탭에서 입력하세요.'); return false; }
+    return true;
+  };
+  const exportFile = async (kind, targets) => {
+    if (targets ? !students.length : !guard()) return;
+    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
+    try {
+      if (kind === 1) { await downloadWorkbook(buildOverviewWorkbook(ctx), `정기고사_선택과목_응시현황_및_확인표.xlsx`); say('✅ [파일 1] 과목별 응시현황 및 응시확인표 다운로드 완료!'); }
+      else { await downloadWorkbook(buildChalkboardWorkbook(ctx, targets || GRADES.flatMap(g => selected[g].map(c => [g, c]))), targets && targets.length === 1 ? `정기고사_칠판부착용_${targets[0][0]}학년${targets[0][1]}반_B4.xlsx` : `정기고사_칠판부착용_상세출력물_B4.xlsx`); say('✅ [파일 2] 칠판 부착용 상세 출력물(B4) 다운로드 완료!'); }
+    } catch (err) { console.error(err); say(`엑셀 생성 오류: ${err.message}`, 'error'); }
+    finally { setBusy(false); }
+  };
+
+  /* ---------- 시간표 편집 ---------- */
+  const editTT = (g, fn) => setTT(prev => { const next = deepClone(prev); fn(next[g]); return next; });
+  const addSub = (g, d, p, sub) => editTT(g, t => { const k = `${d}-${p}`; const cur = t.cells[k] || []; if (!cur.some(x => norm(x) === norm(sub))) t.cells[k] = isSelf(sub) ? [SELF] : [...cur.filter(x => !isSelf(x)), sub]; });
+  const removeSub = (g, d, p, sub) => editTT(g, t => { const k = `${d}-${p}`; t.cells[k] = (t.cells[k] || []).filter(x => x !== sub); if (!t.cells[k].length) delete t.cells[k]; });
+
+  /* =============================== 렌더 =============================== */
+  const ex = students.filter(s => s.excluded);
+  return html`
+  <div className="min-h-screen flex flex-col">
+    <header className="bg-slate-900 text-white shadow-md">
+      <div className="max-w-[1500px] mx-auto px-4 py-5 flex flex-col lg:flex-row justify-between items-center gap-4">
+        <h1 className="text-xl sm:text-2xl xl:text-[28px] font-black tracking-tight leading-snug text-center lg:text-left" style=${{ wordBreak: 'keep-all' }}>
+          고등학교 정기시험 선택과목 분반 및 <span className="inline-block">시험 시간표 자동 편성 시스템</span></h1>
+        <div className="flex items-center gap-2 shrink-0">
+          ${VIEWER ? html`<span className="text-xs font-semibold px-3 py-1.5 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/40">일반 사용자용 · 자료 기준 ${VIEWER.createdAt}</span>` : html`
+          <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-amber-400/20 text-amber-200 border border-amber-300/40">관리자</span>
+          <button onClick=${loadSample} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">✨ 샘플 데이터 로드</button>
+          <button onClick=${saveConfig} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">⚙️ 설정 저장</button>
+          <button id="makeViewer" onClick=${makeViewerFile} className="bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold text-sm px-3.5 py-2.5 rounded-lg">📤 일반 사용자용 파일 만들기</button>`}
+        </div>
+      </div>
+    </header>
+
+    <div className=${`px-6 py-2.5 text-sm font-medium border-b ${msg.type === 'success' ? 'bg-emerald-50 text-emerald-800 border-emerald-200' : msg.type === 'error' ? 'bg-rose-50 text-rose-800 border-rose-200' : 'bg-indigo-50 text-indigo-900 border-indigo-200'}`}>
+      <div className="max-w-[1500px] mx-auto flex flex-wrap items-center gap-2" id="status">
+        <span>${msg.text}</span>
+        <span className="ml-auto text-xs opacity-75">현재 명단: ${sourceLabel || '-'} | 응시 대상 ${students.length - ex.length}명${ex.length ? ` (제외 ${ex.length}명)` : ''}</span>
+      </div>
+    </div>
+
+    <main className="max-w-[1500px] mx-auto w-full p-4 md:p-6 grid grid-cols-1 xl:grid-cols-12 gap-6 flex-grow">
+      ${!VIEWER && html`
+      <div className="xl:col-span-4 space-y-4">
+        ${/* STEP 1 */''}
+        <${Card} step="1" title="학생 선택과목 명단 (1·2·3학년 동시)">
+          <p className="text-[11px] text-slate-500 mb-3">학년별 파일 여러 개를 한꺼번에 고르거나, 학년별 시트가 있는 파일 하나를 올리세요. 학년은 학년 열 → 학번 → 시트명/파일명 순서로 자동 감지합니다.</p>
+          <div className="grid grid-cols-2 gap-2">
+            <label className=${`${btn} bg-indigo-600 hover:bg-indigo-500 text-white`}>⬆ 명단 업로드 (여러 개)
+              <input id="rosterInput" type="file" multiple accept=".xlsx,.xls,.xlsm,.csv" onChange=${onRosterUpload} className="hidden" /></label>
+            <button onClick=${async () => { await downloadWorkbook(buildRosterTemplate(codes), `선택과목_학생명단_표준양식(1~3학년).xlsx`); say('📥 학생 명단 표준 양식(학년별 시트)이 다운로드되었습니다.'); }} className=${`${btn} bg-slate-800 hover:bg-slate-700 text-white`}>⬇ 명단 양식 다운로드</button>
+          </div>
+          ${students.length > 0 && html`
+            <table className="w-full mt-3 text-xs border border-slate-200 rounded-lg overflow-hidden" id="rosterSummary">
+              <thead className="bg-slate-50 text-slate-600"><tr><th className="py-1.5">학년</th><th>학급</th><th>응시 대상</th><th>제외</th><th>명단 과목 열</th></tr></thead>
+              <tbody>${presentGrades.map(g => { const gs = students.filter(s => s.g === g); return html`<tr key=${g} className="text-center border-t border-slate-100">
+                <td className="py-1.5 font-bold text-indigo-700">${g}학년</td><td>${classesByGrade[g].length}개 반</td>
+                <td>${gs.filter(s => !s.excluded).length}명</td><td className=${gs.some(s => s.excluded) ? 'text-rose-600 font-semibold' : 'text-slate-400'}>${gs.filter(s => s.excluded).length}명</td>
+                <td>${roster.subjectsByGrade[g].length}개</td></tr>`; })}</tbody>
+            </table>
+            ${(roster.dup > 0 || roster.unknownGrade > 0) && html`<p className="text-[11px] text-amber-700 mt-2">⚠ ${roster.dup ? `중복 행 ${roster.dup}개(나중 행으로 덮어씀) ` : ''}${roster.unknownGrade ? `학년을 알 수 없어 빠진 학생 ${roster.unknownGrade}명` : ''}</p>`}
+            <details className="mt-2 text-xs" open=${ex.length > 0 && ex.length <= 8}>
+              <summary className="text-slate-600 font-semibold">자동 제외된 학생 ${ex.length}명</summary>
+              ${ex.length === 0 ? html`<p className="text-slate-400 mt-1">없음</p>` : html`<ul className="mt-1 space-y-0.5" id="excludedList">${ex.map(s => html`<li key=${`${s.g}-${s.c}-${s.n}`} className="flex gap-2"><span className="font-semibold">${s.g}학년 ${s.c}반 ${s.n}번</span><span>${s.name}</span><span className="ml-auto text-rose-600">${s.reason}</span></li>`)}</ul>`}
+            </details>`}
+          <div className="mt-3 pt-3 border-t border-slate-100">
+            <div className="text-[11px] font-semibold text-slate-600 mb-1">자동 제외 키워드 (쉼표로 구분 · 명단의 이름/비고 등 어느 칸에 있어도 제외)</div>
+            <div className="flex gap-2"><input value=${keywords} onChange=${e => setKeywords(e.target.value)} className="flex-1 border border-slate-300 rounded-md px-2 py-1 text-xs" />
+              <button onClick=${reapplyKeywords} className="text-xs px-2.5 rounded-md bg-slate-100 hover:bg-slate-200 border border-slate-300">다시 적용</button></div>
+          </div>
+        <//>
+
+        <${Card} step="2" title="시험 시간표 및 과목코드 (학년별)">
+          <p className="text-[11px] text-slate-500 mb-3">'1학년 시간표'~'3학년 시간표', '1학년 과목코드'~'3학년 과목코드' 시트가 있는 파일 하나를 올리세요. 업로드 후 [시간표 확인·수정] 탭에서 직접 고칠 수 있습니다.</p>
+          <div className="grid grid-cols-2 gap-2">
+            <label className=${`${btn} bg-emerald-600 hover:bg-emerald-500 text-white`}>⬆ 시간표 업로드
+              <input id="ttInput" type="file" accept=".xlsx,.xls,.xlsm" onChange=${onTTUpload} className="hidden" /></label>
+            <button onClick=${async () => { await downloadWorkbook(buildTimetableTemplate(tt, codes), `시간표_및_과목코드_표준양식.xlsx`); say('📥 시간표 및 과목코드 양식(현재 입력 내용 포함)이 다운로드되었습니다.'); }} className=${`${btn} bg-slate-800 hover:bg-slate-700 text-white`}>⬇ 시간표 양식 다운로드</button>
+          </div>
+          <div className="grid grid-cols-3 gap-2 mt-3 text-center text-[11px]">
+            ${GRADES.map(g => { const n = exams[g].filter(e => !e.self).length; return html`<div key=${g} className=${`rounded-lg border px-2 py-1.5 ${n ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-slate-200 text-slate-400'}`}><b>${g}학년</b> 시험 ${n}과목<br/>코드 ${(codes[g] || []).length}개</div>`; })}
+          </div>
+        <//>
+
+        <${Card} step="3" title="이동반 산정 방식 (학년별)">
+          <p className="text-[11px] text-slate-500 mb-3">인원은 실제로 이동하는 학생 수입니다. 전출·위탁 등 제외 학생은 건너뛰고 셉니다. (예: 12번 결번, 앞번호 18명 → 1~19번 이동)</p>
+          <div className="space-y-2">
+            ${(presentGrades.length ? presentGrades : GRADES).map(g => html`<div key=${g} className="flex items-center gap-2 flex-wrap">
+              <span className="w-12 text-xs font-bold text-slate-700">${g}학년</span>
+              <${Seg} value=${move[g].dir} onChange=${v => setMove(m => ({ ...m, [g]: { ...m[g], dir: v } }))} options=${[['front', '앞 번호부터 (1학기)'], ['back', '뒷 번호부터 (2학기)']]} size="xs" />
+              <input type="number" min="0" max="50" value=${move[g].count} data-move-grade=${g}
+                onChange=${e => setMove(m => ({ ...m, [g]: { ...m[g], count: Math.max(0, parseInt(e.target.value) || 0) } }))}
+                className="w-14 text-center font-bold border border-slate-300 rounded-md py-1 text-sm" />
+              <span className="text-[11px] text-slate-500">명 이동</span>
+            </div>`)}
+          </div>
+        <//>
+
+        <${Card} step="4" title="대상 학급 선택" right=${html`<div className="flex gap-1 text-[11px]">
+            <button className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200" onClick=${() => setSel(s => Object.fromEntries(Object.keys(s).map(k => [k, true])))}>전체 선택</button>
+            <button className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200" onClick=${() => setSel(s => Object.fromEntries(Object.keys(s).map(k => [k, false])))}>전체 해제</button></div>`}>
+          <div className="flex border-b border-slate-200 mb-3" role="tablist">
+            ${GRADES.map(g => { const total = classesByGrade[g].length, on = selected[g].length; return html`<button key=${g} disabled=${!total} onClick=${() => setSelGrade(g)}
+              className=${`flex-1 py-2 text-xs font-semibold border-b-2 -mb-px ${selGrade === g ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-slate-500'} ${!total ? 'opacity-40' : ''}`}>
+              ${g}학년 <span className=${`ml-1 px-1.5 rounded-full ${on ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-400'}`}>${on}/${total}</span></button>`; })}
+          </div>
+          ${classesByGrade[selGrade].length === 0 ? html`<p className="text-xs text-slate-400">${selGrade}학년 명단이 없습니다.</p>` : html`
+            <div className="flex justify-between items-center mb-2">
+              <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><input type="checkbox"
+                checked=${selected[selGrade].length === classesByGrade[selGrade].length}
+                onChange=${e => setSel(s => ({ ...s, ...Object.fromEntries(classesByGrade[selGrade].map(c => [clsKey(selGrade, c), e.target.checked])) }))} /> ${selGrade}학년 전체</label>
+              <span className="text-[11px] text-slate-400">선택 학급 합계: ${GRADES.reduce((a, g) => a + selected[g].length, 0)}개</span>
+            </div>
+            <div className="grid grid-cols-4 gap-1.5">
+              ${classesByGrade[selGrade].map(c => { const k = clsKey(selGrade, c), n = classStudents(selGrade, c).filter(s => !s.excluded).length; return html`<label key=${k}
+                className=${`flex flex-col items-center p-1.5 rounded-lg border cursor-pointer text-xs ${sel[k] ? 'border-indigo-500 bg-indigo-50 text-indigo-900' : 'border-slate-200 text-slate-500'}`}>
+                <span className="flex items-center gap-1"><input type="checkbox" checked=${!!sel[k]} onChange=${e => setSel(s => ({ ...s, [k]: e.target.checked }))} />${c}반</span>
+                <span className="text-[10px] opacity-70">${n}명</span></label>`; })}
+            </div>`}
+        <//>
+
+        <div className="space-y-2">
+          <button id="export1" onClick=${() => exportFile(1)} disabled=${busy} className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">⬇ [파일 1] 과목별 응시현황 및 응시확인표</button>
+          <button id="export2" onClick=${() => exportFile(2)} disabled=${busy} className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">🖨 [파일 2] 칠판 부착용 상세 출력물(B4)</button>
+        </div>
+      </div>
+
+      `}
+      <div className=${`${VIEWER ? 'xl:col-span-12' : 'xl:col-span-8'} bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col min-w-0`}>
+        <div className="flex flex-wrap gap-1 px-3 pt-3 border-b border-slate-200 bg-slate-50 rounded-t-xl">
+          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표']].filter(([k]) => !VIEWER || k !== 'timetable').map(([k, label]) => html`
+            <button key=${k} data-tab=${k} onClick=${() => setTab(k)} className=${`px-3.5 py-2 text-xs rounded-t-lg ${tab === k ? 'bg-white text-indigo-700 font-bold border border-b-white border-slate-200 -mb-px' : 'text-slate-600 hover:bg-slate-100'}`}>${label}</button>`)}
+        </div>
+        <div className="p-4 overflow-auto">
+          ${tab === 'timetable' && html`<${TimetableEditor} g=${ttGrade} setG=${setTTGrade} tt=${tt} codes=${codes} exams=${exams} roster=${roster} hasStudents=${students.length > 0}
+              codeOf=${codeOf} isCommon=${isCommon} addSub=${addSub} removeSub=${removeSub} editTT=${editTT} />`}
+          ${tab === 'chalkboard' && html`<${ChalkboardPreview} pv=${pv} setPv=${setPv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(2)} onExportClass=${t => exportFile(2, t)} busy=${busy} />`}
+          ${tab === 'overview' && html`<${OverviewPreview} ov=${ov} setOv=${setOv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
+          ${tab === 'confirm' && html`<${ConfirmPreview} cf=${cf} setCf=${setCf} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
+        </div>
+      </div>
+    </main>
+  </div>`;
+}
+
+/* -------------------------- 시간표 확인·수정 탭 -------------------------- */
+function TimetableEditor({ g, setG, tt, codes, exams, roster, hasStudents, codeOf, isCommon, addSub, removeSub, editTT }) {
+  const t = tt[g];
+  const days = Array.from({ length: t.days }, (_, i) => i + 1);
+  const periods = Array.from({ length: t.periods }, (_, i) => i + 1);
+  const placed = new Map();
+  Object.entries(t.cells).forEach(([k, subs]) => subs.forEach(s => { if (!isSelf(s)) placed.set(norm(s), [...(placed.get(norm(s)) || []), k]); }));
+  const codeList = codes[g] || [];
+  const extra = roster.subjectsByGrade[g].filter(s => !codeList.some(c => norm(c.name) === norm(s)));
+  const list = exams[g].filter(e => !e.self && e.day <= t.days && e.period <= t.periods);
+  const noCode = [...new Set(list.filter(e => !e.code).map(e => e.sub))];
+  const common = hasStudents ? [...new Set(list.filter(e => e.common).map(e => e.sub))] : [];
+  const dups = [...placed.entries()].filter(([, ks]) => ks.length > 1).map(([n]) => list.find(e => norm(e.sub) === n)?.sub).filter(Boolean);
+  const notScheduled = roster.subjectsByGrade[g].filter(s => !placed.has(norm(s)));
+  const [showCodes, setShowCodes] = useState(false);
+  const opt = (name, label, k) => html`<option key=${k} value=${name}>${label}${placed.has(norm(name)) ? ' ✓' : ''}</option>`;
+
+  return html`<div>
+    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+      <${Seg} value=${g} onChange=${setG} options=${GRADES.map(x => [x, `${x}학년`])} />
+      <div className="flex flex-wrap gap-1.5 text-[11px]">
+        <span className="self-center text-slate-500 mr-1">교시</span>
+        <button className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50" onClick=${() => editTT(g, x => { x.periods = Math.max(1, x.periods - 1); })}>−</button>
+        <span className="self-center font-bold w-8 text-center">${t.periods}교시</span>
+        <button id="addPeriod" className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50" onClick=${() => editTT(g, x => { x.periods = Math.min(6, x.periods + 1); })}>+</button>
+        <span className="self-center text-slate-500 ml-3 mr-1">일차</span>
+        <button className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50" onClick=${() => editTT(g, x => { x.days = Math.max(1, x.days - 1); })}>−</button>
+        <span className="self-center font-bold w-8 text-center">${t.days}일</span>
+        <button className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-50" onClick=${() => editTT(g, x => { x.days = Math.min(10, x.days + 1); })}>+</button>
+        <button className="ml-3 px-2 py-1 rounded border border-rose-200 text-rose-600 hover:bg-rose-50" onClick=${() => { if (confirm(`${g}학년 시간표의 과목을 모두 비울까요?`)) editTT(g, x => { x.cells = {}; }); }}>비우기</button>
+      </div>
+    </div>
+    <div className="overflow-x-auto">
+      <table className="w-full border-collapse text-xs" id="ttTable">
+        <thead><tr className="bg-slate-100">
+          <th className="border border-slate-300 p-2 w-16">교시</th>
+          ${days.map(d => html`<th key=${d} className="border border-slate-300 p-1.5 min-w-[140px]">
+            <div className="font-bold">${d}일차</div>
+            <input value=${t.labels[d] || ''} placeholder="날짜 입력" onChange=${e => { const v = e.target.value; editTT(g, x => { x.labels[d] = v; }); }}
+              className="mt-1 w-full text-center text-[11px] font-normal border border-slate-200 rounded px-1 py-0.5 bg-white" /></th>`)}
+        </tr></thead>
+        <tbody>${periods.map(p => html`<tr key=${p}>
+          <td className=${`border border-slate-300 text-center font-bold ${p >= 4 ? 'bg-amber-50' : 'bg-slate-50'}`}>${p}교시</td>
+          ${days.map(d => { const subs = t.cells[`${d}-${p}`] || []; return html`<td key=${d} className="border border-slate-300 p-1.5 align-top" data-cell=${`${d}-${p}`}>
+            <div className="flex flex-col gap-1">
+              ${subs.map(s => { const self = isSelf(s), code = self ? '' : codeOf(g, s), cm = hasStudents && isCommon(g, s);
+                return html`<div key=${s} className=${`relative rounded-md px-2 py-1 pr-5 border ${self ? 'bg-slate-100 border-slate-300 text-slate-500' : !code ? 'bg-amber-50 border-amber-300' : 'bg-indigo-50 border-indigo-200 text-indigo-900'}`}>
+                  <div className="font-semibold leading-tight">${s}</div>
+                  <div className="text-[10px] opacity-75">${self ? '자습 · 시험 없음' : code ? `코드 ${code}` : '코드 없음'}${cm ? ' · 전원 응시' : ''}</div>
+                  <button title="삭제" onClick=${() => removeSub(g, d, p, s)} className="absolute top-0.5 right-1 text-slate-400 hover:text-rose-600 font-bold">×</button></div>`; })}
+              <select value="" onChange=${e => { if (e.target.value) addSub(g, d, p, e.target.value); }} className="tt-select w-full border border-dashed border-slate-300 rounded px-1 py-1 text-slate-500 bg-white">
+                <option value="">+ 과목 추가</option>
+                <option value=${SELF}>자기주도학습 (시험 없음)</option>
+                <optgroup label=${`${g}학년 과목코드`}>${codeList.map(c => opt(c.name, `${c.code} ${c.name}`, c.code + c.name))}</optgroup>
+                ${extra.length > 0 && html`<optgroup label="명단에만 있는 과목 (코드 없음)">${extra.map(s => opt(s, s, 'x' + s))}</optgroup>`}
+              </select>
+            </div></td>`; })}
+        </tr>`)}</tbody>
+      </table>
+    </div>
+    <div className="mt-3 space-y-1.5 text-[11px]" id="ttWarnings">
+      ${noCode.length > 0 && html`<p className="text-amber-700">⚠ 과목코드가 없는 과목: ${noCode.join(', ')} → '${g}학년 과목코드' 시트에 추가하세요.</p>`}
+      ${dups.length > 0 && html`<p className="text-amber-700">⚠ 두 번 이상 배치된 과목: ${dups.join(', ')}</p>`}
+      ${common.length > 0 && html`<p className="text-sky-700">ℹ 명단에 해당 과목 열이 없어 <b>학년 전원 응시(공통과목)</b>로 처리: ${common.join(', ')}</p>`}
+      ${hasStudents && notScheduled.length > 0 && html`<p className="text-slate-500">ℹ 명단에는 있지만 시간표에 없는 과목: ${notScheduled.join(', ')}</p>`}
+    </div>
+    <div className="mt-3">
+      <button className="text-[11px] text-indigo-600 underline" onClick=${() => setShowCodes(v => !v)}>${showCodes ? '과목코드 목록 접기' : `${g}학년 과목코드 목록 보기 (${codeList.length}개)`}</button>
+      ${showCodes && html`<div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-1 text-[11px]">${codeList.map(c => html`<div key=${c.code + c.name} className="border border-slate-200 rounded px-2 py-1"><b className="text-indigo-700">${c.code}</b> ${c.name}</div>`)}</div>`}
+    </div>
+  </div>`;
+}
+
+/* ----------------------- 미리보기 공통: 학년·학급 선택 ----------------------- */
+function GradeClassPicker({ g, c, onChange, presentGrades, classesByGrade, selected, allowAll }) {
+  const classes = classesByGrade[g] || [];
+  return html`<div className="flex items-center gap-2 text-xs">
+    <label className="flex items-center gap-1">학년
+      <select data-pick="grade" value=${g} onChange=${e => { const ng = +e.target.value; onChange(ng, allowAll ? 'all' : (classesByGrade[ng] || [])[0]); }} className="border border-slate-300 rounded px-1.5 py-1">
+        ${presentGrades.map(x => html`<option key=${x} value=${x}>${x}학년</option>`)}</select></label>
+    <label className="flex items-center gap-1">학급
+      <select data-pick="class" value=${c} onChange=${e => onChange(g, e.target.value === 'all' ? 'all' : +e.target.value)} className="border border-slate-300 rounded px-1.5 py-1">
+        ${allowAll && html`<option value="all">선택 학급 전체</option>`}
+        ${classes.map(x => html`<option key=${x} value=${x}>${x}반${selected[g].includes(x) ? '' : ' (미선택)'}</option>`)}</select></label>
+  </div>`;
+}
+const pbtn = 'px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-50';
+// 실제 크기 HTML 페이지를 화면 폭에 맞게 축소해서 보여준다
+function ScaledPage({ htmlStr, widthPx, heightPx, zoom }) {
+  const ref = useRef(null);
+  const [boxW, setBoxW] = useState(900);
+  useEffect(() => {
+    const el = ref.current; if (!el) return;
+    const ro = new ResizeObserver(() => setBoxW(el.clientWidth)); ro.observe(el); return () => ro.disconnect();
+  }, []);
+  const z = zoom === 'fit' ? Math.min(1, (boxW - 16) / widthPx, Math.max(360, window.innerHeight - 140) / heightPx) : parseInt(zoom) / 100;
+  return html`<div ref=${ref} className="bg-slate-200 rounded-lg p-2 overflow-auto">
+    <div style=${{ width: widthPx * z, height: heightPx * z }} className="mx-auto shadow-lg">
+      <div style=${{ width: widthPx, transform: `scale(${z})`, transformOrigin: 'top left' }} dangerouslySetInnerHTML=${{ __html: htmlStr }} />
+    </div></div>`;
+}
+const MM = 96 / 25.4;
+
+/* ------------------------- 칠판 부착용 B4 미리보기 ------------------------- */
+function ChalkboardPreview({ pv, setPv, ctx, classesByGrade, presentGrades, onExport, onExportClass, busy }) {
+  const { selected, tt } = ctx;
+  const g = presentGrades.includes(pv.g) ? pv.g : presentGrades[0];
+  if (!g) return html`<p className="text-sm text-slate-400">명단을 먼저 업로드하세요.</p>`;
+  const classes = classesByGrade[g];
+  const c = classes.includes(pv.c) ? pv.c : classes[0];
+  const { df, range, pages } = chalkPagesFor(g, c, pv.kind, ctx);
+  const pg = pages.find(p => p.day === pv.day) || pages[0];
+  const set = o => setPv(p => ({ ...p, ...o }));
+  const selTargets = GRADES.flatMap(x => selected[x].map(y => [x, y]));
+  return html`<div>
+    <div className="flex flex-wrap items-center gap-3 mb-2">
+      <${GradeClassPicker} g=${g} c=${c} onChange=${(ng, nc) => set({ g: ng, c: nc })} presentGrades=${presentGrades} classesByGrade=${classesByGrade} selected=${selected} />
+      <${Seg} value=${pv.kind} onChange=${v => set({ kind: v })} options=${[['고정', '고정반'], ['이동', '이동반']]} size="xs" />
+      <label className="flex items-center gap-1 text-xs">일차 <select data-pick="day" value=${pg ? pg.day : ''} onChange=${e => set({ day: +e.target.value })} className="border border-slate-300 rounded px-1.5 py-1">${pages.map(p => html`<option key=${p.day} value=${p.day}>${p.day}일차 (${tt[g].labels[p.day] || ''})</option>`)}</select></label>
+      <${Seg} value=${pv.zoom} onChange=${v => set({ zoom: v })} options=${[['fit', '📐 맞춤'], ['50%', '50%'], ['75%', '75%'], ['100%', '100%']]} size="xs" />
+    </div>
+    <div className="text-xs text-slate-600 mb-2" id="pvRange">${pv.kind}반 범위: <b>${range}</b> (${df.length}명)${pg ? ` · 이 날 ${pg.rows.length}행, 글씨 ${pg.f3}pt` : ''}</div>
+    <div className="flex flex-wrap gap-1.5 mb-3">
+      <button data-print="page" disabled=${!pg} onClick=${() => printPages([chalkPageHTML(pg)], 'b4')} className=${`${pbtn} bg-slate-800 text-white`}>🖨 현재 페이지 인쇄</button>
+      <button data-print="class" onClick=${() => printPages(chalkAllPages(ctx, [[g, c]]).map(chalkPageHTML), 'b4')} className=${`${pbtn} bg-slate-700 text-white`}>🖨 ${g}학년 ${c}반 전체 인쇄 (고정·이동)</button>
+      <button data-print="all" onClick=${() => printPages(chalkAllPages(ctx, selTargets).map(chalkPageHTML), 'b4')} className=${`${pbtn} bg-slate-600 text-white`}>🖨 선택 학급 모두 인쇄</button>
+      <button data-xl="class" onClick=${() => onExportClass([[g, c]])} disabled=${busy} className=${`${pbtn} bg-emerald-600 text-white ml-auto`}>⬇ ${g}학년 ${c}반 B4 엑셀</button>
+      <button data-xl="all" onClick=${onExport} disabled=${busy} className=${`${pbtn} bg-emerald-700 text-white`}>⬇ 선택 학급 B4 엑셀</button>
+    </div>
+    ${!df.length ? html`<p className="p-10 text-center text-slate-500 bg-slate-50 rounded-lg">${g}학년 ${c}반 ${pv.kind}반 학생이 없습니다.</p>`
+      : !pg ? html`<p className="p-10 text-center text-slate-500 bg-slate-50 rounded-lg">${g}학년 시간표에 시험 과목이 없습니다.</p>`
+      : html`<${ScaledPage} htmlStr=${chalkPageHTML(pg)} widthPx=${364 * MM} heightPx=${256.5 * MM} zoom=${pv.zoom} />`}
+    <p className="mt-2 text-[11px] text-slate-500">B4 가로 1장 = 하루 시간표. 시험 교시 수와 과목 수에 맞춰 행 높이와 글씨 크기가 자동으로 정해집니다. 인쇄 시 용지는 B4(364×257mm) 가로로 자동 지정됩니다.</p>
+  </div>`;
+}
+
+/* --------------------------- 과목별 응시현황 미리보기 --------------------------- */
+function OverviewPreview({ ov, setOv, ctx, classesByGrade, presentGrades, onExport, busy }) {
+  const { selected, move } = ctx;
+  const g = presentGrades.includes(ov.g) ? ov.g : presentGrades[0];
+  if (!g) return html`<p className="text-sm text-slate-400">명단을 먼저 업로드하세요.</p>`;
+  const classes = ov.c === 'all' ? selected[g] : (classesByGrade[g].includes(ov.c) ? [ov.c] : selected[g]);
+  const htmlStr = overviewHTML(g, classes, ctx);
+  const gradeHTML = x => overviewHTML(x, selected[x], ctx);
+  return html`<div>
+    <div className="flex flex-wrap items-center gap-3 mb-2">
+      <${GradeClassPicker} g=${g} c=${ov.c} allowAll=${true} onChange=${(ng, nc) => setOv({ g: ng, c: nc })} presentGrades=${presentGrades} classesByGrade=${classesByGrade} selected=${selected} />
+      <span className="text-xs text-slate-600">이동 방식: <b>${move[g].dir === 'front' ? '앞 번호부터' : '뒷 번호부터'}</b> ${move[g].count}명</span>
+    </div>
+    <div className="flex flex-wrap gap-1.5 mb-3">
+      <button data-print="ov" disabled=${!htmlStr} onClick=${() => printPages([htmlStr], 'b4ov')} className=${`${pbtn} bg-slate-800 text-white`}>🖨 현재 화면 인쇄 (B4 가로)</button>
+      <button data-print="ovall" onClick=${() => printPages(GRADES.map(gradeHTML).filter(Boolean), 'b4ov')} className=${`${pbtn} bg-slate-600 text-white`}>🖨 전 학년 인쇄 (학년별 1장)</button>
+      ${!VIEWER && html`<button onClick=${onExport} disabled=${busy} className=${`${pbtn} bg-indigo-600 text-white ml-auto`}>⬇ [파일 1] 엑셀 다운로드</button>`}
+    </div>
+    ${htmlStr ? html`<div className="overflow-x-auto" id="ovPreview" dangerouslySetInnerHTML=${{ __html: htmlStr }} />`
+      : html`<p className="p-10 text-center text-slate-400">${g}학년: 시험 과목 또는 선택 학급이 없습니다.</p>`}
+  </div>`;
+}
+
+/* --------------------------- 반별 응시확인표 미리보기 --------------------------- */
+function ConfirmPreview({ cf, setCf, ctx, classesByGrade, presentGrades, onExport, busy }) {
+  const { selected } = ctx;
+  const g = presentGrades.includes(cf.g) ? cf.g : presentGrades[0];
+  if (!g) return html`<p className="text-sm text-slate-400">명단을 먼저 업로드하세요.</p>`;
+  const c = classesByGrade[g].includes(cf.c) ? cf.c : classesByGrade[g][0];
+  const htmlStr = confirmHTML(g, c, ctx);
+  const selTargets = GRADES.flatMap(x => selected[x].map(y => [x, y]));
+  return html`<div>
+    <div className="flex flex-wrap items-center gap-3 mb-2">
+      <${GradeClassPicker} g=${g} c=${c} onChange=${(ng, nc) => setCf({ g: ng, c: nc })} presentGrades=${presentGrades} classesByGrade=${classesByGrade} selected=${selected} />
+    </div>
+    <div className="flex flex-wrap gap-1.5 mb-3">
+      <button data-print="cf" onClick=${() => printPages([htmlStr], 'a4')} className=${`${pbtn} bg-slate-800 text-white`}>🖨 ${g}학년 ${c}반 인쇄 (A4)</button>
+      <button data-print="cfall" onClick=${() => printPages(selTargets.map(([x, y]) => confirmHTML(x, y, ctx)), 'a4')} className=${`${pbtn} bg-slate-600 text-white`}>🖨 선택 학급 모두 인쇄</button>
+      ${!VIEWER && html`<button onClick=${onExport} disabled=${busy} className=${`${pbtn} bg-indigo-600 text-white ml-auto`}>⬇ [파일 1] 엑셀 다운로드</button>`}
+    </div>
+    <${ScaledPage} htmlStr=${`<div style="padding:10mm;background:#fff;min-height:277mm;box-sizing:border-box">${htmlStr}</div>`} widthPx=${210 * MM} heightPx=${297 * MM} zoom="fit" />
+  </div>`;
+}
+
+document.head.insertAdjacentHTML('beforeend', `<style id="printcss">${PRINT_CSS}</style>`);
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>
+</body>
+</html>
