@@ -32,7 +32,7 @@
  * ===================================================================== */
 const { useState, useMemo, useEffect, useRef, Fragment } = React;
 // 일반 사용자용 파일이면 관리자가 넣어 둔 결과 데이터가 여기에 들어 있다 (없으면 관리자 모드)
-const VIEWER = window.__VIEWER__ || null;
+let VIEWER = window.__VIEWER__ || null; // 암호화된 파일은 비밀번호 확인 후 채워진다
 const html = htm.bind(React.createElement);
 
 const SELF = '자기주도학습';
@@ -538,16 +538,69 @@ function buildOverviewWorkbook(ctx) {
 
 /* ------------------------- 일반 사용자용 파일 만들기 -------------------------
  * 지금 화면의 프로그램 코드 + 결과 데이터를 하나의 HTML로 묶는다.
- * 그 파일을 열면 관리 기능 없이 미리보기·인쇄·칠판 엑셀 다운로드만 보인다. */
-function buildViewerHTML(payload) {
+ * 그 파일을 열면 관리 기능 없이 미리보기·인쇄·칠판 엑셀 다운로드만 보인다.
+ * 비밀번호를 정하면 데이터를 암호화(AES-256-GCM)해서 넣고, 열 때 비밀번호를 물어본다. */
+function buildViewerHTML(payload, enc) {
   const head = [...document.querySelectorAll('head link[rel=preconnect], head link[rel=stylesheet], head script[src]')].map(e => e.outerHTML).join('\n');
   const base = document.getElementById('base-style').outerHTML;
   const app = document.getElementById('app').textContent;
-  const data = JSON.stringify(payload).replace(/</g, '\\u003c');
+  const data = JSON.stringify(enc || payload).replace(/</g, '\\u003c');
   const S = 'script';
-  return `<!doctype html>\n<html lang="ko">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>정기시험 출력물 (일반 사용자용)</title>\n${head}\n${base}\n</head>\n<body>\n<div id="root"></div>\n<${S}>window.__VIEWER__ = ${data};</${S}>\n<${S} id="app">${app}</${S}>\n</body>\n</html>\n`;
+  return `<!doctype html>\n<html lang="ko">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<meta name="robots" content="noindex, nofollow">\n<title>정기시험 출력물 (일반 사용자용)</title>\n${head}\n${base}\n</head>\n<body>\n<div id="root"></div>\n<${S}>window.${enc ? '__VIEWER_ENC__' : '__VIEWER__'} = ${data};</${S}>\n<${S} id="app">${app}</${S}>\n</body>\n</html>\n`;
 }
 const stamp = d => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}_${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}`;
+
+/* ------------------------------ 암호화 (Web Crypto) ------------------------------ */
+const b64 = buf => { const a = buf instanceof Uint8Array ? buf : new Uint8Array(buf); let s = ''; for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64 = str => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+const cryptoReady = () => !!(window.crypto && crypto.subtle);
+async function deriveKey(pw, salt, iter) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encryptJSON(obj, pw) {
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12)), iter = 250000;
+  const key = await deriveKey(pw, salt, iter);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
+  return { v: 1, alg: 'AES-GCM/PBKDF2-SHA256', iter, salt: b64(salt), iv: b64(iv), ct: b64(ct), createdAt: obj.createdAt };
+}
+async function decryptJSON(enc, pw) {
+  const key = await deriveKey(pw, unb64(enc.salt), enc.iter);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(enc.iv) }, key, unb64(enc.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+/* ------------------------------ GitHub 업로드 ------------------------------
+ * GitHub Contents API로 파일 하나를 만들거나 덮어쓴다 (토큰: Contents 읽기·쓰기 권한) */
+const GH_KEY = 'exam_generator_github_v1';
+async function githubError(r) {
+  let m = ''; try { m = (await r.json()).message || ''; } catch (e) { /* 무시 */ }
+  if (r.status === 401) return '토큰이 올바르지 않거나 만료되었습니다.';
+  if (r.status === 403) return `권한이 없습니다. 토큰에 이 저장소의 Contents 쓰기 권한이 있는지 확인하세요. (${m})`;
+  if (r.status === 404) return '저장소를 찾을 수 없습니다. 사용자명·저장소명·브랜치와 토큰의 저장소 접근 권한을 확인하세요.';
+  if (r.status === 409 || r.status === 422) return `저장 충돌이 발생했습니다. 잠시 후 다시 시도하세요. (${m})`;
+  return `GitHub 오류 ${r.status}: ${m}`;
+}
+async function githubPut(gh, content, message) {
+  const path = gh.path.replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+  const api = `https://api.github.com/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/contents/${path}`;
+  const headers = { Authorization: `Bearer ${gh.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  let sha;
+  const g = await fetch(`${api}?ref=${encodeURIComponent(gh.branch)}`, { headers, cache: 'no-store' });
+  if (g.ok) sha = (await g.json()).sha; else if (g.status !== 404) throw new Error(await githubError(g));
+  const body = { message, branch: gh.branch, content: b64(new TextEncoder().encode(content)) };
+  if (sha) body.sha = sha;
+  const r = await fetch(api, { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(await githubError(r));
+  return r.json();
+}
+function pagesLink(gh, version) {
+  let base = (gh.pages || '').trim();
+  if (!base && gh.owner && gh.repo) base = gh.repo.toLowerCase() === `${gh.owner.toLowerCase()}.github.io` ? `https://${gh.owner}.github.io/` : `https://${gh.owner}.github.io/${gh.repo}/`;
+  if (!base) return '';
+  const p = gh.path.replace(/^\/+/, '').replace(/(^|\/)index\.html$/, '$1');
+  return base.replace(/\/?$/, '/') + p + (version ? `?v=${version}` : '');
+}
 
 /* ------------------------------ 웹 인쇄 ------------------------------ */
 const PRINT_CSS = `
@@ -684,6 +737,7 @@ function App() {
   const [msg, setMsg] = useState({ text: '준비되었습니다.', type: 'info' });
   const [busy, setBusy] = useState(false);
   const [savedAt, setSavedAt] = useState('');
+  const [shareOpen, setShareOpen] = useState(false);
   // 화면 상태
   const [tab, setTab] = useState(VIEWER ? 'chalkboard' : 'timetable');
   const [selGrade, setSelGrade] = useState(3);
@@ -728,20 +782,16 @@ function App() {
     say(`일반 사용자용 화면입니다. 학년·학급을 골라 미리보기 후 인쇄하거나 칠판 부착물 엑셀을 내려받으세요. (자료 기준: ${VIEWER.createdAt})`, 'info');
   };
   // 관리자: 결과 데이터를 담은 일반 사용자용 HTML 파일 만들기
-  const makeViewerFile = () => {
-    if (!guard()) return;
+  // 관리자: 일반 사용자용 파일에 넣을 결과 데이터
+  const makePayload = () => {
     const now = new Date();
-    const payload = {
+    return {
       v: 1, createdAt: now.toLocaleString('ko-KR'), label: `${sourceLabel} (${now.toLocaleDateString('ko-KR')} 기준)`,
       students: students.map(({ g, c, n, id, name, gender, taken, excluded, reason }) => ({ g, c, n, id, name, gender, taken, excluded, reason })),
       subjectsByGrade: roster.subjectsByGrade, tt, codes, move, sel,
     };
-    const blob = new Blob([buildViewerHTML(payload)], { type: 'application/octet-stream' });
-    const url = URL.createObjectURL(blob), a = document.createElement('a');
-    a.href = url; a.download = `정기시험_출력물_일반사용자용_${stamp(now)}.html`;
-    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-    say('📤 일반 사용자용 파일을 만들었습니다. 이 파일을 선생님들께 배포하세요. (학생 이름이 들어 있으니 교내에서만 공유하세요)');
   };
+  const makeViewerFile = () => { if (guard()) setShareOpen(true); };
 
   // 시작 시: 저장된 설정 복원 + 샘플 명단
   useEffect(() => {
@@ -901,6 +951,7 @@ function App() {
           <button onClick=${loadSample} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">✨ 샘플 데이터 로드</button>
           <button id="saveBtn" onClick=${saveConfig} title=${savedAt ? `마지막 저장: ${savedAt}` : '아직 저장하지 않음'} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">💾 설정 저장</button>
           <button id="resetBtn" onClick=${resetConfig} className="bg-slate-800 hover:bg-rose-900 text-rose-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">🔄 설정 초기화</button>
+          <button id="lockBtn" onClick=${lockAdmin} title="관리자 화면 잠그기 (다시 들어올 때 비밀번호 필요)" className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3 py-2.5 rounded-lg border border-slate-700">🔒</button>
           <button id="makeViewer" onClick=${makeViewerFile} className="bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold text-sm px-3.5 py-2.5 rounded-lg">📤 일반 사용자용 파일 만들기</button>`}
         </div>
       </div>
@@ -1014,6 +1065,7 @@ function App() {
         </div>
       </div>
     </main>
+    ${shareOpen && html`<${ShareDialog} onClose=${() => setShareOpen(false)} makePayload=${makePayload} say=${say} />`}
   </div>`;
 }
 
@@ -1197,8 +1249,197 @@ function ConfirmPreview({ cf, setCf, ctx, classesByGrade, presentGrades, onExpor
   </div>`;
 }
 
+/* ---------------------- 일반 사용자용 파일 만들기 창 (관리자) ---------------------- */
+function ShareDialog({ onClose, makePayload, say }) {
+  let saved = {}; try { saved = JSON.parse(safeStorage.get(GH_KEY) || '{}'); } catch (e) { saved = {}; }
+  const [gh, setGh] = useState({ owner: '', repo: '', branch: 'main', path: 'viewer/index.html', pages: '', token: '', remember: true, ...saved });
+  const [pw, setPw] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [link, setLink] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [showGh, setShowGh] = useState(!saved.owner);
+  const set = o => setGh(g => ({ ...g, ...o }));
+  const pwErr = !pw ? '' : pw.length < 6 ? '6자 이상으로 정하세요.' : pw !== pw2 ? '두 비밀번호가 다릅니다.' : '';
+  const pwOk = pw.length >= 6 && pw === pw2;
+  const ghOk = gh.owner.trim() && gh.repo.trim() && gh.branch.trim() && gh.path.trim() && gh.token.trim();
+
+  const build = async () => {
+    const payload = makePayload();
+    if (!pw) return { html: buildViewerHTML(payload), payload };
+    if (!cryptoReady()) throw new Error('이 브라우저에서는 암호화를 쓸 수 없습니다. (https 주소나 내 PC 파일로 열어 주세요)');
+    return { html: buildViewerHTML(payload, await encryptJSON(payload, pw)), payload };
+  };
+  const download = async () => {
+    if (pw && !pwOk) { setErr(pwErr); return; }
+    setBusy(true); setErr('');
+    try {
+      const { html: h } = await build();
+      const blob = new Blob([h], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob), a = document.createElement('a');
+      a.href = url; a.download = `정기시험_출력물_일반사용자용_${stamp(new Date())}.html`;
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      say(pw ? '📤 비밀번호가 걸린 일반 사용자용 파일을 내려받았습니다.' : '📤 일반 사용자용 파일을 내려받았습니다. (암호 없음 · 학생 이름이 들어 있으니 교내에서만 공유하세요)');
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const upload = async () => {
+    if (!pwOk) { setErr('GitHub에 올릴 때는 열람 비밀번호가 꼭 필요합니다. ' + (pwErr || '')); return; }
+    if (!ghOk) { setErr('GitHub 설정(사용자명·저장소·브랜치·경로·토큰)을 모두 입력하세요.'); setShowGh(true); return; }
+    setBusy(true); setErr(''); setLink('');
+    try {
+      const { html: h, payload } = await build();
+      await githubPut(gh, h, `정기시험 출력물 갱신 (${payload.createdAt})`);
+      const keep = { owner: gh.owner.trim(), repo: gh.repo.trim(), branch: gh.branch.trim(), path: gh.path.trim(), pages: gh.pages.trim(), remember: gh.remember };
+      if (gh.remember) keep.token = gh.token.trim();
+      safeStorage.set(GH_KEY, JSON.stringify(keep));
+      const l = pagesLink(gh, stamp(new Date()));
+      setLink(l);
+      say('☁ GitHub에 올렸습니다. 링크와 비밀번호를 선생님들께 전달하세요. (반영까지 1~2분 걸릴 수 있습니다)');
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 1500); }
+    catch (e) { const el = document.getElementById('shareLink'); if (el) { el.select(); document.execCommand('copy'); setCopied(true); } }
+  };
+  const inp = 'w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm';
+  const lab = 'block text-[11px] font-semibold text-slate-600 mb-1';
+  return html`<div className="fixed inset-0 z-50 bg-slate-900/60 flex items-start justify-center p-4 overflow-auto" onClick=${e => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl mt-10 p-6" role="dialog" aria-label="일반 사용자용 파일 만들기">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-black">📤 일반 사용자용 파일 만들기</h2>
+        <button onClick=${onClose} disabled=${busy} className="text-slate-400 hover:text-slate-700 text-xl">×</button>
+      </div>
+
+      <div className="rounded-xl border border-slate-200 p-4 mb-3">
+        <div className="text-sm font-bold mb-1">① 열람 비밀번호</div>
+        <p className="text-[11px] text-slate-500 mb-2">파일 속 학생 명단을 이 비밀번호로 암호화합니다. 링크를 연 사람은 비밀번호를 넣어야 내용을 볼 수 있습니다. 비밀번호는 어디에도 저장되지 않으니 잊지 않게 기록해 두세요.</p>
+        <div className="grid grid-cols-2 gap-2">
+          <div><label className=${lab}>비밀번호 (6자 이상)</label><input id="sharePw" type="password" autoComplete="new-password" value=${pw} onInput=${e => setPw(e.target.value)} className=${inp} /></div>
+          <div><label className=${lab}>비밀번호 확인</label><input id="sharePw2" type="password" autoComplete="new-password" value=${pw2} onInput=${e => setPw2(e.target.value)} className=${inp} /></div>
+        </div>
+        ${pwErr && html`<p className="text-[11px] text-rose-600 mt-1">${pwErr}</p>`}
+      </div>
+
+      <div className="rounded-xl border border-slate-200 p-4 mb-3">
+        <button className="w-full flex items-center justify-between text-sm font-bold" onClick=${() => setShowGh(v => !v)}>
+          <span>② GitHub 저장 위치 ${gh.owner && gh.repo ? html`<span className="font-normal text-slate-500 text-xs">(${gh.owner}/${gh.repo} · ${gh.path})</span>` : ''}</span><span className="text-slate-400">${showGh ? '▲' : '▼'}</span></button>
+        ${showGh && html`<div className="mt-3 grid grid-cols-2 gap-2">
+          <div><label className=${lab}>GitHub 사용자명(또는 조직)</label><input id="ghOwner" value=${gh.owner} onInput=${e => set({ owner: e.target.value })} placeholder="예: myschool" className=${inp} /></div>
+          <div><label className=${lab}>저장소 이름</label><input id="ghRepo" value=${gh.repo} onInput=${e => set({ repo: e.target.value })} placeholder="예: exam-generator" className=${inp} /></div>
+          <div><label className=${lab}>브랜치</label><input value=${gh.branch} onInput=${e => set({ branch: e.target.value })} className=${inp} /></div>
+          <div><label className=${lab}>저장 경로</label><input value=${gh.path} onInput=${e => set({ path: e.target.value })} className=${inp} /></div>
+          <div className="col-span-2"><label className=${lab}>접근 토큰 (Fine-grained token · 이 저장소 Contents 읽기/쓰기)</label><input id="ghToken" type="password" autoComplete="off" value=${gh.token} onInput=${e => set({ token: e.target.value })} placeholder="github_pat_..." className=${inp} />
+            <label className="flex items-center gap-1.5 text-[11px] text-slate-600 mt-1"><input type="checkbox" checked=${gh.remember} onChange=${e => set({ remember: e.target.checked })} /> 이 PC 브라우저에 토큰 기억 (공용 PC에서는 끄세요)</label></div>
+          <div className="col-span-2"><label className=${lab}>GitHub Pages 주소 (비우면 자동: https://사용자명.github.io/저장소/)</label><input value=${gh.pages} onInput=${e => set({ pages: e.target.value })} placeholder=${pagesLink({ ...gh, pages: '' }) || 'https://...'} className=${inp} /></div>
+          ${saved.token && html`<button className="col-span-2 text-[11px] text-rose-600 underline text-left" onClick=${() => { safeStorage.set(GH_KEY, JSON.stringify({ ...saved, token: '' })); set({ token: '' }); }}>기억된 토큰 지우기</button>`}
+        </div>`}
+      </div>
+
+      ${err && html`<p id="shareErr" className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2.5 mb-3">${err}</p>`}
+      ${link && html`<div className="rounded-xl border-2 border-emerald-400 bg-emerald-50 p-4 mb-3">
+        <div className="text-sm font-bold text-emerald-800 mb-2">✅ 올리기 완료 — 이 링크와 비밀번호를 전달하세요</div>
+        <div className="flex gap-2"><input id="shareLink" readOnly value=${link} onFocus=${e => e.target.select()} className="flex-1 border border-emerald-300 rounded-md px-2 py-1.5 text-sm bg-white" />
+          <button onClick=${copy} className="px-3 rounded-md bg-emerald-600 text-white text-sm font-semibold">${copied ? '복사됨' : '복사'}</button>
+          <a href=${link} target="_blank" rel="noopener" className="px-3 rounded-md border border-emerald-400 text-emerald-700 text-sm font-semibold flex items-center">열기</a></div>
+        <p className="text-[11px] text-emerald-800 mt-2">링크 주소는 매번 같고 내용만 최신으로 바뀝니다. GitHub 반영에 1~2분 걸릴 수 있으니 바로 열리지 않으면 잠시 후 다시 열어 보세요.</p>
+      </div>`}
+
+      <div className="flex flex-wrap gap-2 justify-end">
+        <button id="shareDownload" onClick=${download} disabled=${busy} className="px-4 py-2.5 rounded-lg border border-slate-300 text-sm font-semibold hover:bg-slate-50 disabled:opacity-50">⬇ 파일로 내려받기${pw ? ' (암호)' : ''}</button>
+        <button id="shareUpload" onClick=${upload} disabled=${busy} className="px-4 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-bold disabled:opacity-50">${busy ? '처리 중…' : '☁ GitHub에 올리고 링크 받기'}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------------------- 일반 사용자: 비밀번호 확인 화면 ---------------------- */
+/* ---------------------- 관리자: 처음 접속 시 비밀번호 확인 ----------------------
+ * 비밀번호 원문은 코드에 넣지 않고 SHA-256 해시만 둔다. 확인되면 이 탭을 닫을 때까지 유지. */
+const ADMIN_HASH = '26055b4bf21a9dce7805852bd69e554097965979a63c6beb24aa944a3df7d8bb'; // sha256('exam-admin:' + 비밀번호)
+const ADMIN_SESSION_KEY = 'exam_admin_ok_v1';
+function sha256Hex(str) { // 순수 JS SHA-256 (https가 아닌 환경에서도 동작)
+  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  const bytes = new TextEncoder().encode(str), len = bytes.length;
+  const n = (((len + 9) >> 6) + 1) << 4, w = new Uint32Array(n);
+  for (let i = 0; i < len; i++) w[i >> 2] |= bytes[i] << (24 - (i % 4) * 8);
+  w[len >> 2] |= 0x80 << (24 - (len % 4) * 8); w[n - 1] = len * 8;
+  let h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const r = (x, k) => (x >>> k) | (x << (32 - k)), W = new Uint32Array(64);
+  for (let i = 0; i < n; i += 16) {
+    for (let t = 0; t < 64; t++) W[t] = t < 16 ? w[i + t] : (r(W[t-2],17) ^ r(W[t-2],19) ^ (W[t-2] >>> 10)) + W[t-7] + (r(W[t-15],7) ^ r(W[t-15],18) ^ (W[t-15] >>> 3)) + W[t-16];
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let t = 0; t < 64; t++) {
+      const t1 = (hh + (r(e,6) ^ r(e,11) ^ r(e,25)) + ((e & f) ^ (~e & g)) + K[t] + W[t]) >>> 0;
+      const t2 = ((r(a,2) ^ r(a,13) ^ r(a,22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h = h.map((v, k) => (v + [a, b, c, d, e, f, g, hh][k]) >>> 0);
+  }
+  return h.map(v => v.toString(16).padStart(8, '0')).join('');
+}
+const sessionOk = () => { try { return sessionStorage.getItem(ADMIN_SESSION_KEY) === ADMIN_HASH; } catch (e) { return false; } };
+function AdminGate() {
+  const [ok, setOk] = useState(sessionOk);
+  const [pw, setPw] = useState('');
+  const [err, setErr] = useState('');
+  if (ok) return html`<${App} />`;
+  const submit = e => {
+    e.preventDefault();
+    if (sha256Hex('exam-admin:' + pw) === ADMIN_HASH) { try { sessionStorage.setItem(ADMIN_SESSION_KEY, ADMIN_HASH); } catch (x) { /* 무시 */ } setOk(true); }
+    else { setErr('비밀번호가 맞지 않습니다.'); setPw(''); }
+  };
+  return html`<div className="min-h-screen flex items-center justify-center bg-slate-900 p-4">
+    <form onSubmit=${submit} className="bg-white rounded-2xl shadow-2xl p-7 w-full max-w-sm">
+      <div className="text-3xl mb-2">🛡️</div>
+      <h1 className="text-lg font-black leading-snug mb-1" style=${{ wordBreak: 'keep-all' }}>고등학교 정기시험 선택과목 분반 및 시험 시간표 자동 편성 시스템</h1>
+      <p className="text-xs text-slate-500 mb-4">관리자 비밀번호를 입력하세요.</p>
+      <input id="adminPw" type="password" inputMode="numeric" autoFocus value=${pw} onInput=${e => { setPw(e.target.value); setErr(''); }} placeholder="관리자 비밀번호" className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-base mb-2" />
+      ${err && html`<p id="adminErr" className="text-sm text-rose-600 mb-2">${err}</p>`}
+      <button id="adminOpen" type="submit" disabled=${!pw} className="w-full bg-slate-900 hover:bg-slate-700 disabled:opacity-50 text-white font-bold py-2.5 rounded-lg">관리자 화면 열기</button>
+      <p className="text-[11px] text-slate-400 mt-3">한 번 입력하면 이 브라우저 탭을 닫을 때까지 유지됩니다.</p>
+    </form>
+  </div>`;
+}
+const lockAdmin = () => { try { sessionStorage.removeItem(ADMIN_SESSION_KEY); } catch (e) { /* 무시 */ } location.reload(); };
+
+const VIEWER_PW_KEY = 'exam_viewer_pw_v1';
+function Gate() {
+  const enc = window.__VIEWER_ENC__;
+  const [open, setOpen] = useState(!enc);
+  const [pw, setPw] = useState('');
+  const [remember, setRemember] = useState(true);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(!!enc && !!safeStorage.get(VIEWER_PW_KEY));
+  const tryOpen = async (p, silent) => {
+    if (!cryptoReady()) { setErr('이 브라우저에서는 암호를 풀 수 없습니다. 크롬·엣지 최신 버전으로 열어 주세요.'); setBusy(false); return; }
+    setBusy(true); setErr('');
+    try {
+      VIEWER = await decryptJSON(enc, p);
+      if (remember || silent) safeStorage.set(VIEWER_PW_KEY, p);
+      setOpen(true);
+    } catch (e) {
+      if (silent) safeStorage.remove(VIEWER_PW_KEY); else setErr('비밀번호가 맞지 않습니다.');
+      setBusy(false);
+    }
+  };
+  useEffect(() => { const saved = safeStorage.get(VIEWER_PW_KEY); if (enc && saved) tryOpen(saved, true); }, []);
+  if (open) return VIEWER ? html`<${App} />` : html`<${AdminGate} />`;
+  return html`<div className="min-h-screen flex items-center justify-center bg-slate-900 p-4">
+    <form onSubmit=${e => { e.preventDefault(); if (pw) tryOpen(pw, false); }} className="bg-white rounded-2xl shadow-2xl p-7 w-full max-w-sm">
+      <div className="text-3xl mb-2">🔒</div>
+      <h1 className="text-lg font-black leading-snug mb-1" style=${{ wordBreak: 'keep-all' }}>정기시험 선택과목 응시현황 · 출력물</h1>
+      <p className="text-xs text-slate-500 mb-4">학생 정보 보호를 위해 비밀번호가 필요합니다.${enc.createdAt ? ` (자료 기준: ${enc.createdAt})` : ''}</p>
+      <input id="gatePw" type="password" autoFocus value=${pw} onInput=${e => setPw(e.target.value)} placeholder="비밀번호" className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-base mb-2" />
+      <label className="flex items-center gap-1.5 text-xs text-slate-600 mb-3"><input type="checkbox" checked=${remember} onChange=${e => setRemember(e.target.checked)} /> 이 기기에서 비밀번호 기억</label>
+      ${err && html`<p id="gateErr" className="text-sm text-rose-600 mb-2">${err}</p>`}
+      <button id="gateOpen" type="submit" disabled=${busy || !pw} className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold py-2.5 rounded-lg">${busy ? '여는 중…' : '열기'}</button>
+    </form>
+  </div>`;
+}
+
 document.head.insertAdjacentHTML('beforeend', `<style id="printcss">${PRINT_CSS}</style>`);
-ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${Gate} />`);
 </script>
 </body>
 </html>
