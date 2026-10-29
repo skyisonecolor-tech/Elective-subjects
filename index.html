@@ -64,6 +64,7 @@ const deepClone = o => JSON.parse(JSON.stringify(o));
 const safeStorage = {
   get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } },
+  remove(k) { try { localStorage.removeItem(k); } catch (e) { /* 무시 */ } },
 };
 
 function emptyTT() {
@@ -682,6 +683,7 @@ function App() {
   const [codes, setCodes] = useState(defaultCodes);
   const [msg, setMsg] = useState({ text: '준비되었습니다.', type: 'info' });
   const [busy, setBusy] = useState(false);
+  const [savedAt, setSavedAt] = useState('');
   // 화면 상태
   const [tab, setTab] = useState(VIEWER ? 'chalkboard' : 'timetable');
   const [selGrade, setSelGrade] = useState(3);
@@ -747,12 +749,16 @@ function App() {
     let cfg = null;
     try { const raw = safeStorage.get(CONFIG_KEY); if (raw) cfg = JSON.parse(raw); } catch (e) { cfg = null; }
     if (cfg) {
-      if (cfg.keywords) setKeywords(cfg.keywords);
+      const kw = cfg.keywords || DEFAULT_KEYWORDS;
+      setKeywords(kw);
       if (cfg.move) setMove(m => ({ ...m, ...cfg.move }));
       if (cfg.tt) setTT(t => ({ ...t, ...cfg.tt }));
       if (cfg.codes) setCodes(c => ({ ...c, ...cfg.codes }));
-      applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)', cfg.keywords || DEFAULT_KEYWORDS, cfg.sel || {});
-      say('저장된 설정(시간표·과목코드·이동반·학급 선택)을 불러왔습니다. 명단 파일을 업로드하세요.', 'info');
+      // 저장해 둔 명단 원본이 있으면 그대로 다시 읽고, 없으면 샘플 명단
+      const hasRoster = Array.isArray(cfg.sources) && cfg.sources.length > 0;
+      applySources(hasRoster ? cfg.sources : sampleSources(), hasRoster ? cfg.label : '샘플 데이터 (1~3학년, 9개 학급)', kw, cfg.sel || {});
+      setSavedAt(cfg.savedAt || '');
+      say(hasRoster ? `💾 마지막으로 저장한 상태(명단·시간표·설정)를 불러왔습니다. (저장 시각: ${cfg.savedAt || '-'})` : '저장된 설정을 불러왔습니다. 명단 파일을 업로드하세요.', 'info');
     } else loadSample();
   }, []);
 
@@ -802,9 +808,28 @@ function App() {
     } catch (err) { say(`시간표 파일 읽기 오류: ${err.message}`, 'error'); }
   };
 
+  // 명단 원본 + 시간표·과목코드·이동반·학급 선택·제외 키워드를 이 브라우저에 저장 (새로고침해도 유지)
   const saveConfig = () => {
-    const ok = safeStorage.set(CONFIG_KEY, JSON.stringify({ v: 8, keywords, move, sel, tt, codes }));
-    say(ok ? '💾 설정(시간표·과목코드·이동반·학급 선택·제외 키워드)이 이 브라우저에 저장되었습니다.' : '이 브라우저에서는 설정을 저장할 수 없습니다.', ok ? 'success' : 'error');
+    const savedAt = new Date().toLocaleString('ko-KR');
+    const base = { v: 9, savedAt, keywords, move, sel, tt, codes };
+    const isSample = sourceLabel.startsWith('샘플 데이터');
+    let ok = safeStorage.set(CONFIG_KEY, JSON.stringify(isSample ? base : { ...base, label: sourceLabel, sources: sourcesRef.current }));
+    if (!ok) { // 저장 공간이 부족하면 명단을 빼고 설정만 저장
+      ok = safeStorage.set(CONFIG_KEY, JSON.stringify(base));
+      if (ok) { setSavedAt(savedAt); say('⚠ 명단이 너무 커서 명단은 저장하지 못했습니다. 시간표·설정만 저장되었습니다.', 'error'); return; }
+    }
+    if (ok) setSavedAt(savedAt);
+    say(ok ? `💾 저장 완료 (${savedAt}) — 명단${isSample ? '(샘플 제외)' : ''}·시간표·과목코드·이동반·학급 선택이 이 브라우저에 보관됩니다. 새로고침해도 유지됩니다.` : '이 브라우저에서는 저장할 수 없습니다. (개인정보 보호 모드 등)', ok ? 'success' : 'error');
+  };
+  // 저장 내용을 모두 지우고 처음 상태(샘플)로
+  const resetConfig = () => {
+    if (!confirm('저장된 명단·시간표·설정을 모두 지우고 처음 상태로 되돌릴까요?\n(되돌릴 수 없습니다)')) return;
+    safeStorage.remove(CONFIG_KEY);
+    setKeywords(DEFAULT_KEYWORDS);
+    setMove({ 1: { ...DEFAULT_MOVE }, 2: { ...DEFAULT_MOVE }, 3: { ...DEFAULT_MOVE } });
+    setTT(sampleTT()); setCodes(defaultCodes()); setSavedAt('');
+    applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)', DEFAULT_KEYWORDS, {});
+    say('🔄 설정을 초기화했습니다. 샘플 데이터 상태입니다.', 'info');
   };
 
   /* ---------- 파생 데이터 ---------- */
@@ -874,7 +899,8 @@ function App() {
           ${VIEWER ? html`<span className="text-xs font-semibold px-3 py-1.5 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/40">일반 사용자용 · 자료 기준 ${VIEWER.createdAt}</span>` : html`
           <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-amber-400/20 text-amber-200 border border-amber-300/40">관리자</span>
           <button onClick=${loadSample} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">✨ 샘플 데이터 로드</button>
-          <button onClick=${saveConfig} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">⚙️ 설정 저장</button>
+          <button id="saveBtn" onClick=${saveConfig} title=${savedAt ? `마지막 저장: ${savedAt}` : '아직 저장하지 않음'} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">💾 설정 저장</button>
+          <button id="resetBtn" onClick=${resetConfig} className="bg-slate-800 hover:bg-rose-900 text-rose-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">🔄 설정 초기화</button>
           <button id="makeViewer" onClick=${makeViewerFile} className="bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold text-sm px-3.5 py-2.5 rounded-lg">📤 일반 사용자용 파일 만들기</button>`}
         </div>
       </div>
