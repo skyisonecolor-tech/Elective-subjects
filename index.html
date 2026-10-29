@@ -573,6 +573,11 @@ async function decryptJSON(enc, pw) {
 /* ------------------------------ GitHub 업로드 ------------------------------
  * GitHub Contents API로 파일 하나를 만들거나 덮어쓴다 (토큰: Contents 읽기·쓰기 권한) */
 const GH_KEY = 'exam_generator_github_v1';
+// 기본 저장 위치 (토큰은 보안상 코드에 넣지 않고, 관리자 PC 브라우저에만 저장)
+const DEFAULT_GH = { owner: 'skyisonecolor', repo: 'Elective-subjects', branch: 'main', path: 'viewer/index.html', pages: '' };
+const loadGh = () => { let v = {}; try { v = JSON.parse(safeStorage.get(GH_KEY) || '{}'); } catch (e) { v = {}; } const o = { ...DEFAULT_GH, token: '' }; Object.keys(v).forEach(k => { if (v[k]) o[k] = v[k]; }); return o; };
+const saveGh = gh => safeStorage.set(GH_KEY, JSON.stringify({ owner: gh.owner.trim(), repo: gh.repo.trim(), branch: gh.branch.trim(), path: gh.path.trim(), pages: (gh.pages || '').trim(), token: (gh.token || '').trim() }));
+const maskToken = t => (t ? `${t.slice(0, 11)}…${t.slice(-4)}` : '');
 async function githubError(r) {
   let m = ''; try { m = (await r.json()).message || ''; } catch (e) { /* 무시 */ }
   if (r.status === 401) return '토큰이 올바르지 않거나 만료되었습니다.';
@@ -1251,15 +1256,17 @@ function ConfirmPreview({ cf, setCf, ctx, classesByGrade, presentGrades, onExpor
 
 /* ---------------------- 일반 사용자용 파일 만들기 창 (관리자) ---------------------- */
 function ShareDialog({ onClose, makePayload, say }) {
-  let saved = {}; try { saved = JSON.parse(safeStorage.get(GH_KEY) || '{}'); } catch (e) { saved = {}; }
-  const [gh, setGh] = useState({ owner: '', repo: '', branch: 'main', path: 'viewer/index.html', pages: '', token: '', remember: true, ...saved });
+  const [gh, setGh] = useState(loadGh);
+  const [tokenEdit, setTokenEdit] = useState(() => !loadGh().token);
+  const [newToken, setNewToken] = useState('');
+  const [tokenMsg, setTokenMsg] = useState('');
   const [pw, setPw] = useState('');
   const [pw2, setPw2] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [link, setLink] = useState('');
   const [copied, setCopied] = useState(false);
-  const [showGh, setShowGh] = useState(!saved.owner);
+  const [showGh, setShowGh] = useState(() => !loadGh().token);
   const set = o => setGh(g => ({ ...g, ...o }));
   const pwErr = !pw ? '' : pw.length < 6 ? '6자 이상으로 정하세요.' : pw !== pw2 ? '두 비밀번호가 다릅니다.' : '';
   const pwOk = pw.length >= 6 && pw === pw2;
@@ -1285,18 +1292,26 @@ function ShareDialog({ onClose, makePayload, say }) {
   };
   const upload = async () => {
     if (!pwOk) { setErr('GitHub에 올릴 때는 열람 비밀번호가 꼭 필요합니다. ' + (pwErr || '')); return; }
-    if (!ghOk) { setErr('GitHub 설정(사용자명·저장소·브랜치·경로·토큰)을 모두 입력하세요.'); setShowGh(true); return; }
+    if (!ghOk) { setErr(gh.token ? 'GitHub 설정(사용자명·저장소·브랜치·경로)을 확인하세요.' : 'GitHub 접근 토큰을 먼저 입력하고 [토큰 저장]을 누르세요.'); setShowGh(true); setTokenEdit(true); return; }
     setBusy(true); setErr(''); setLink('');
     try {
       const { html: h, payload } = await build();
       await githubPut(gh, h, `정기시험 출력물 갱신 (${payload.createdAt})`);
-      const keep = { owner: gh.owner.trim(), repo: gh.repo.trim(), branch: gh.branch.trim(), path: gh.path.trim(), pages: gh.pages.trim(), remember: gh.remember };
-      if (gh.remember) keep.token = gh.token.trim();
-      safeStorage.set(GH_KEY, JSON.stringify(keep));
+      saveGh(gh);
       const l = pagesLink(gh, stamp(new Date()));
       setLink(l);
       say('☁ GitHub에 올렸습니다. 링크와 비밀번호를 선생님들께 전달하세요. (반영까지 1~2분 걸릴 수 있습니다)');
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const storeToken = () => {
+    const t = newToken.trim();
+    if (!/^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$/.test(t)) { setTokenMsg('토큰 형식이 아닙니다. github_pat_ 로 시작하는 토큰 전체를 붙여 넣으세요.'); return; }
+    const next = { ...gh, token: t }; setGh(next); saveGh(next);
+    setNewToken(''); setTokenEdit(false); setTokenMsg('✅ 토큰을 저장했습니다. 다음부터 자동으로 사용됩니다.');
+  };
+  const clearToken = () => {
+    if (!confirm('저장된 GitHub 토큰을 이 브라우저에서 지울까요?')) return;
+    const next = { ...gh, token: '' }; setGh(next); saveGh(next); setTokenEdit(true); setTokenMsg('토큰을 지웠습니다.');
   };
   const copy = async () => {
     try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 1500); }
@@ -1325,14 +1340,21 @@ function ShareDialog({ onClose, makePayload, say }) {
         <button className="w-full flex items-center justify-between text-sm font-bold" onClick=${() => setShowGh(v => !v)}>
           <span>② GitHub 저장 위치 ${gh.owner && gh.repo ? html`<span className="font-normal text-slate-500 text-xs">(${gh.owner}/${gh.repo} · ${gh.path})</span>` : ''}</span><span className="text-slate-400">${showGh ? '▲' : '▼'}</span></button>
         ${showGh && html`<div className="mt-3 grid grid-cols-2 gap-2">
-          <div><label className=${lab}>GitHub 사용자명(또는 조직)</label><input id="ghOwner" value=${gh.owner} onInput=${e => set({ owner: e.target.value })} placeholder="예: myschool" className=${inp} /></div>
-          <div><label className=${lab}>저장소 이름</label><input id="ghRepo" value=${gh.repo} onInput=${e => set({ repo: e.target.value })} placeholder="예: exam-generator" className=${inp} /></div>
+          <div><label className=${lab}>GitHub 사용자명(또는 조직)</label><input id="ghOwner" value=${gh.owner} onInput=${e => set({ owner: e.target.value })} placeholder=${DEFAULT_GH.owner} className=${inp} /></div>
+          <div><label className=${lab}>저장소 이름</label><input id="ghRepo" value=${gh.repo} onInput=${e => set({ repo: e.target.value })} placeholder=${DEFAULT_GH.repo} className=${inp} /></div>
           <div><label className=${lab}>브랜치</label><input value=${gh.branch} onInput=${e => set({ branch: e.target.value })} className=${inp} /></div>
           <div><label className=${lab}>저장 경로</label><input value=${gh.path} onInput=${e => set({ path: e.target.value })} className=${inp} /></div>
-          <div className="col-span-2"><label className=${lab}>접근 토큰 (Fine-grained token · 이 저장소 Contents 읽기/쓰기)</label><input id="ghToken" type="password" autoComplete="off" value=${gh.token} onInput=${e => set({ token: e.target.value })} placeholder="github_pat_..." className=${inp} />
-            <label className="flex items-center gap-1.5 text-[11px] text-slate-600 mt-1"><input type="checkbox" checked=${gh.remember} onChange=${e => set({ remember: e.target.checked })} /> 이 PC 브라우저에 토큰 기억 (공용 PC에서는 끄세요)</label></div>
+          <div className="col-span-2"><label className=${lab}>접근 토큰 (Fine-grained token · 이 저장소 Contents Read and write)</label>
+            ${gh.token && !tokenEdit ? html`<div className="flex items-center gap-2" id="tokenSaved">
+                <span className="flex-1 text-xs bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-md px-2 py-1.5">✅ 저장된 토큰 사용 중 <code className="ml-1">${maskToken(gh.token)}</code></span>
+                <button id="tokenChange" onClick=${() => { setTokenEdit(true); setTokenMsg(''); }} className="text-xs px-2.5 py-1.5 rounded-md border border-slate-300 hover:bg-slate-50">토큰 변경</button>
+                <button onClick=${clearToken} className="text-xs px-2.5 py-1.5 rounded-md border border-rose-200 text-rose-600 hover:bg-rose-50">지우기</button></div>`
+            : html`<div className="flex gap-2"><input id="ghToken" type="password" autoComplete="off" value=${newToken} onInput=${e => { setNewToken(e.target.value); setTokenMsg(''); }} placeholder="github_pat_..." className=${inp} />
+                <button id="tokenSave" onClick=${storeToken} className="shrink-0 text-xs px-3 rounded-md bg-slate-900 text-white font-semibold">토큰 저장</button>
+                ${gh.token && html`<button onClick=${() => { setTokenEdit(false); setNewToken(''); }} className="shrink-0 text-xs px-2.5 rounded-md border border-slate-300">취소</button>`}</div>`}
+            ${tokenMsg && html`<p id="tokenMsg" className=${`text-[11px] mt-1 ${tokenMsg.startsWith('✅') ? 'text-emerald-700' : 'text-rose-600'}`}>${tokenMsg}</p>`}
+            <p className="text-[11px] text-slate-500 mt-1">토큰은 이 PC 브라우저에만 저장되며 프로그램 코드·일반 사용자용 파일에는 들어가지 않습니다. 만료되면 [토큰 변경]으로 새 토큰을 넣으세요.</p></div>
           <div className="col-span-2"><label className=${lab}>GitHub Pages 주소 (비우면 자동: https://사용자명.github.io/저장소/)</label><input value=${gh.pages} onInput=${e => set({ pages: e.target.value })} placeholder=${pagesLink({ ...gh, pages: '' }) || 'https://...'} className=${inp} /></div>
-          ${saved.token && html`<button className="col-span-2 text-[11px] text-rose-600 underline text-left" onClick=${() => { safeStorage.set(GH_KEY, JSON.stringify({ ...saved, token: '' })); set({ token: '' }); }}>기억된 토큰 지우기</button>`}
         </div>`}
       </div>
 
