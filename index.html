@@ -456,7 +456,7 @@ function overviewHTML(g, classes, ctx) {
   const body = rows.map(r => `<tr><td class="peach c b">${r.lab}<br><span style="font-weight:400;font-size:.9em">(${esc(r.range)})</span></td><td class="lblue c b">${r.c}반</td>${r.cells.map(st =>
     st.kind === 'self' ? `<td class="gray c">${SELF}</td>` : st.kind === 'none' ? `<td class="peach red c b">미응시</td>` : st.kind === 'all' ? `<td class="c b">${esc(st.text)}</td>` : `<td><b>응시인원( ${st.count}명 ) =</b> ${esc(st.text.split('= ')[1])}</td>`).join('')}</tr>`).join('');
   const sum = `<tr class="sum"><td colspan="2" class="lgray c b">응시 인원 합계</td>${list.map((e, i) => e.self ? '<td class="gray c">-</td>' : `<td class="c b">${sums[i]}명</td>`).join('')}</tr>`;
-  return `<div class="ovw" style="font-size:${fs}pt"><div class="ovtitle">${g}학년 과목별 응시현황 <span>(${classes.map(c => c + '반').join(', ')})</span></div>`
+  return `<div class="ovw" style="font-size:${fs}pt"><div class="ovtitle">${esc(ctx.examTitle)} ${g}학년 과목별 응시현황 <span>(${classes.map(c => c + '반').join(', ')})</span></div>`
     + `<table class="ovt" style="width:${Math.max(348, list.length * 30 + 45)}mm"><colgroup><col style="width:30mm"><col style="width:13mm"></colgroup><thead><tr><th rowspan="2" class="lgray">일시/교시</th><th rowspan="2" class="lgray">반</th>${head1}</tr><tr>${head2}</tr></thead><tbody>${body}${sum}</tbody></table></div>`;
 }
 function confirmHTML(g, c, ctx) {
@@ -464,7 +464,7 @@ function confirmHTML(g, c, ctx) {
   const subs = exams[g].filter(e => !e.self);
   const list = classStudents(g, c).filter(s => !s.excluded).sort(byNum);
   const fs = list.length > 30 ? 9 : 10;
-  return `<div class="cfw" style="font-size:${fs}pt"><div class="cftitle">${g}학년 ${c}반 정기시험 선택과목 응시 확인표</div>`
+  return `<div class="cfw" style="font-size:${fs}pt"><div class="cfsub">${esc(ctx.examTitle)}</div><div class="cftitle">${g}학년 ${c}반 선택과목 응시 확인표</div>`
     + `<table class="cft"><colgroup><col style="width:8%"><col style="width:15%"><col><col style="width:14%"></colgroup><thead><tr><th>번호</th><th>이름</th><th>응시하는 선택과목</th><th>확인(서명)</th></tr></thead><tbody>`
     + list.map(s => { const mine = [...new Set(subs.filter(e => takers(g, [s], e.sub).length).map(e => e.sub))]; return `<tr><td class="c">${s.n}</td><td class="c">${esc(s.name)}</td><td>${esc(mine.length ? mine.join(', ') : '해당 없음(미응시)')}</td><td></td></tr>`; }).join('')
     + `</tbody></table></div>`;
@@ -482,10 +482,12 @@ function buildOverviewWorkbook(ctx) {
     const ws = wb.addWorksheet(`${g}학년_응시현황`, { pageSetup: { paperSize: 12, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: .3, right: .3, top: .4, bottom: .4, header: .1, footer: .1 } } });
     ws.getColumn(1).width = 22; ws.getColumn(2).width = 8;
     list.forEach((e, i) => { ws.getColumn(i + 3).width = e.self ? 16 : 32; });
+    const tr0 = ws.addRow([`${ctx.examTitle} ${g}학년 과목별 응시현황`]); tr0.height = 34;
+    ws.mergeCells(1, 1, 1, list.length + 2); tr0.getCell(1).font = XL.font(16, true); tr0.getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
     const r1 = ws.addRow(['일시/교시', '반', ...list.map(e => slotLabel(tt[g].labels, e))]); r1.height = 34;
     const r2 = ws.addRow(['일시/교시', '반', ...list.map(e => e.self ? SELF : `${e.sub}\r\n(${e.code || '코드없음'})`)]); r2.height = 48;
-    ws.mergeCells('A1:A2'); ws.mergeCells('B1:B2');
-    [1, 2].forEach(c => [1, 2].forEach(r => { const x = ws.getCell(r, c); x.fill = lgray; x.border = XL.border; x.font = XL.font(11, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; }));
+    ws.mergeCells('A2:A3'); ws.mergeCells('B2:B3');
+    [1, 2].forEach(c => [2, 3].forEach(r => { const x = ws.getCell(r, c); x.fill = lgray; x.border = XL.border; x.font = XL.font(11, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; }));
     list.forEach((e, i) => {
       const a = r1.getCell(i + 3); a.fill = peach; a.border = XL.border; a.font = XL.font(10.5, true); a.alignment = { vertical: 'top', horizontal: 'center', wrapText: true };
       const b = r2.getCell(i + 3); b.fill = e.self ? gray : navy; b.border = XL.border; b.font = XL.font(10.5, true, e.self ? 'FF64748B' : 'FFFFFFFF'); b.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
@@ -518,8 +520,8 @@ function buildOverviewWorkbook(ctx) {
       const nCount = list.length, rowH = nCount > 30 ? 21.5 : nCount > 25 ? 22.5 : 24, fs = nCount > 30 ? 9 : 9.5;
       const ws = wb.addWorksheet(`${g}-${c}반_응시확인`, { pageSetup: { paperSize: 9, orientation: 'portrait', horizontalCentered: true, fitToPage: true, fitToWidth: 1, fitToHeight: 1, margins: { left: .2, right: .2, top: .25, bottom: .25, header: 0, footer: 0 } } });
       ws.getColumn(1).width = 6; ws.getColumn(2).width = 11; ws.getColumn(3).width = 88; ws.getColumn(4).width = 10;
-      const t = ws.addRow([`${g}학년 ${c}반 정기시험 선택과목 응시 확인표`, '', '', '']); t.height = 32;
-      ws.mergeCells('A1:D1'); const tc = ws.getCell('A1'); tc.font = XL.font(16, true); tc.alignment = { vertical: 'middle', horizontal: 'center' };
+      const t = ws.addRow([`${ctx.examTitle}\n${g}학년 ${c}반 선택과목 응시 확인표`, '', '', '']); t.height = 46;
+      ws.mergeCells('A1:D1'); const tc = ws.getCell('A1'); tc.font = XL.font(16, true); tc.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
       const hd = ws.addRow(['번호', '이름', '응시하는 선택과목', '확인(서명)']); hd.height = 24;
       [1, 2, 3, 4].forEach(i => { const x = hd.getCell(i); x.fill = XL.fill('FFE7E6E6'); x.border = XL.border; x.font = XL.font(10.5, true); x.alignment = { vertical: 'middle', horizontal: 'center' }; });
       list.forEach(s => {
@@ -535,6 +537,107 @@ function buildOverviewWorkbook(ctx) {
   });
   return wb;
 }
+
+/* ------------------------------- 시험명 -------------------------------- */
+function defaultExam() {
+  const d = new Date(), m = d.getMonth() + 1;
+  return { year: m <= 2 ? d.getFullYear() - 1 : d.getFullYear(), sem: (m >= 8 || m <= 2) ? 2 : 1, round: 1 };
+}
+const examTitleOf = ex => `${ex.year}학년도 ${ex.sem}학기 ${ex.round}차 정기시험`;
+// '9월 28일 월요일' → '9/28(월)'
+function shortDate(label, d) {
+  const m = String(label || '').match(/(\d+)\s*월\s*(\d+)\s*일\s*\(?\s*([월화수목금토일])/);
+  return m ? `${m[1]}/${m[2]}(${m[3]})` : (label || `${d}일차`);
+}
+
+/* ---------------------- 반별 결시 학생 현황 (A4 세로 1장) ----------------------
+ * 학년·반·구분(이동반/고정반)마다 1장. 상단: 학년/반/재적/결번/재적번호,
+ * 표: 일시·교시·과목명·응시인원(그 아래 결시자 기록 공간)·감독교사 확인 */
+const ABS_NOTE = '♣ 결시 학생을 정확하게 파악하셔서 결시자 OMR카드에 기록 및 마킹해 주시고, 답안지 회수용 봉투에도 기록해 주시기 바랍니다.';
+const ABS_HEAD = '결시자 번호 – 이름 - 사유(공결,병결,미인정결,기타결)\n*해당자가 없을 시는 "없음"으로 표기*';
+function absenceData(g, c, kind, ctx) {
+  const { exams, tt, classStudents, move, takers, examTitle } = ctx;
+  const sp = splitClass(classStudents(g, c), move[g].dir, move[g].count);
+  const df = kind === '이동' ? sp.moved : sp.fixed;
+  const range = kind === '이동' ? sp.movedLabel : sp.fixedLabel;
+  const ns = df.map(s => s.n), set = new Set(ns);
+  const gaps = [];
+  if (ns.length) for (let i = Math.min(...ns); i <= Math.max(...ns); i++) if (!set.has(i)) gaps.push(i);
+  const list = [...exams[g]].sort((a, b) => a.day - b.day || a.period - b.period || (a.code || '99').localeCompare(b.code || '99'));
+  const rows = list.map(e => ({ e, st: statusOf(g, e, df, takers), date: shortDate(tt[g].labels[e.day], e.day) }));
+  rows.forEach((r, i) => {
+    r.first = i === 0 || rows[i - 1].e.day !== r.e.day;
+    if (r.first) { let k = i; while (k < rows.length && rows[k].e.day === r.e.day) k++; r.span = k - i; }
+  });
+  const rangeText = df.length ? `(${Math.min(...ns)}~${Math.max(...ns)}번)` : '-';
+  return { g, c, kind, df, range, rangeText, gaps, rows, title: `${examTitle} 결시 학생 현황` };
+}
+function absenceHTML(a) {
+  const n = Math.max(1, a.rows.length);
+  const slotH = Math.min(22, (277 - 12 - 3 - 36 - 9 - 4) / n); // mm
+  const fsStatus = slotH < 11 ? 8.5 : slotH < 14 ? 9.5 : 10.5;
+  const body = a.rows.map(r => `<tr style="height:${slotH}mm">`
+    + (r.first ? `<td rowspan="${r.span}" class="c b" style="font-size:${slotH * r.span < 24 ? 10 : 12.5}pt;white-space:nowrap;padding:0 1pt">${esc(r.date)}</td>` : '')
+    + `<td class="c b">${r.e.period}</td><td class="c b${r.e.self ? ' muted' : ''}" style="font-size:${r.e.sub.length > 8 ? 10 : 12}pt">${esc(r.e.sub)}</td>`
+    + `<td colspan="4" class="st" style="font-size:${fsStatus}pt">${r.e.self ? '' : esc(r.st.text)}</td><td></td></tr>`).join('');
+  const cols = [10.86, 5.17, 18.9, 11.88, 28.74, 7.02, 6.51, 10.92].map(w => `<col style="width:${w}%">`).join('');
+  return `<div class="abw"><div class="abtitle">${esc(a.title)}</div>`
+    + `<table class="abt"><colgroup>${cols}</colgroup><tbody>`
+    + `<tr class="hd"><td colspan="2" class="c b">${a.g} 학년</td><td class="c b">${a.c} 반</td><td class="c b">재적</td><td class="c">${a.df.length}명</td><td rowspan="2" class="c b">결번</td><td rowspan="2" colspan="2" class="c" style="font-size:11pt">${esc(a.gaps.join(', '))}</td></tr>`
+    + `<tr class="hd"><td colspan="3" class="c b">${a.kind}반</td><td class="c b">재적번호</td><td class="c">${esc(a.rangeText)}</td></tr>`
+    + `<tr class="hd"><td class="c b">일시</td><td class="c b" style="font-size:10pt;padding:0">교시</td><td class="c b">과목명</td><td colspan="4" class="c b" style="font-size:9pt;white-space:pre-line;line-height:1.35">${esc(ABS_HEAD)}</td><td class="c b" style="font-size:9pt">감독교사확인<br>(이름&amp;인장)</td></tr>`
+    + body + `</tbody></table><div class="abnote">${esc(ABS_NOTE)}</div></div>`;
+}
+function absenceAllPages(ctx, targets) {
+  const out = [];
+  targets.forEach(([g, c]) => ['이동', '고정'].forEach(kind => { const a = absenceData(g, c, kind, ctx); if (a.df.length) out.push(a); }));
+  return out;
+}
+// [파일 3] 반별 결시 학생 현황 — 첨부 양식과 같은 열 구성, A4 세로 1장에 맞춤
+function buildAbsenceWorkbook(ctx, targets) {
+  const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템'; wb.created = new Date();
+  const B = XL.border, center = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  absenceAllPages(ctx, targets).forEach(a => {
+    const ws = wb.addWorksheet(`${a.g}학년${a.c}반_${a.kind}반`, { pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 1, horizontalCentered: true, margins: { left: .4, right: .4, top: .39, bottom: .39, header: 0, footer: 0 } } });
+    [1.9, 17, 8.1, 29.6, 18.6, 45, 11, 10.2, 17.1, 2.6].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+    const put = (addr, v, font, align = center, border = true) => { const x = ws.getCell(addr); x.value = v; x.font = font; x.alignment = align; if (border) x.border = B; return x; };
+    ws.getRow(1).height = 41.25; ws.mergeCells('B1:I1'); put('B1', a.title, XL.font(19, true), center, false);
+    ws.getRow(2).height = 12;
+    [3, 4, 5].forEach(r => { ws.getRow(r).height = 54; });
+    ws.mergeCells('B3:C3'); ws.mergeCells('G3:G4'); ws.mergeCells('H3:I4'); ws.mergeCells('B4:D4'); ws.mergeCells('E5:H5');
+    put('B3', `${a.g} 학년`, XL.font(18, true)); put('D3', `${a.c} 반`, XL.font(18, true)); put('E3', '재적', XL.font(18, true)); put('F3', `${a.df.length}명`, XL.font(18));
+    put('G3', '결번', XL.font(18, true)); put('H3', a.gaps.join(', '), XL.font(16));
+    put('B4', `${a.kind}반`, XL.font(18, true)); put('E4', '재적번호', XL.font(18, true)); put('F4', a.rangeText, XL.font(18));
+    put('B5', '일시', XL.font(18, true)); put('C5', '교시', XL.font(18, true)); put('D5', '과목명', XL.font(18, true));
+    put('E5', ABS_HEAD, XL.font(15, true)); put('I5', '감독교사확인\n(이름&인장)', XL.font(15, true));
+    ['C3', 'I3', 'C4', 'D4', 'G4', 'H4', 'I4', 'F5', 'G5', 'H5'].forEach(ad => { ws.getCell(ad).border = B; });
+    const n = Math.max(1, a.rows.length), h = Math.max(42, Math.min(95, (1300 - 41.25 - 12 - 162 - 24) / n));
+    a.rows.forEach((r, i) => {
+      const row = 6 + i; ws.getRow(row).height = h;
+      if (r.first) { put(`B${row}`, r.date, XL.font(r.span > 1 ? 26 : 18, true)); if (r.span > 1) ws.mergeCells(`B${row}:B${row + r.span - 1}`); }
+      put(`C${row}`, r.e.period, XL.font(18, true));
+      put(`D${row}`, r.e.sub, XL.font(r.e.sub.length > 8 ? 15 : 18, true, r.e.self ? 'FF64748B' : 'FF000000'));
+      ws.mergeCells(`E${row}:H${row}`);
+      put(`E${row}`, r.e.self ? '' : r.st.text, XL.font(16), { vertical: 'top', horizontal: 'left', wrapText: true });
+      ['B', 'F', 'G', 'H'].forEach(col => { ws.getCell(`${col}${row}`).border = B; });
+      put(`I${row}`, '', XL.font(16));
+    });
+    const last = 6 + a.rows.length; ws.getRow(last).height = 24;
+    ws.mergeCells(`B${last}:I${last}`); put(`B${last}`, ABS_NOTE, XL.font(12), { vertical: 'middle', horizontal: 'left', wrapText: true }, false);
+    ws.pageSetup.printArea = `A1:J${last}`;
+  });
+  return wb;
+}
+const ABS_CSS = `
+.abw{font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;color:#000;background:#fff;width:190mm}
+.abtitle{font-size:17pt;font-weight:900;text-align:center;height:12mm;line-height:12mm;margin-bottom:3mm;white-space:nowrap}
+.abt{width:100%;border-collapse:collapse;table-layout:fixed}
+.abt td{border:1px solid #000;font-size:12pt;vertical-align:middle;padding:0 4pt;overflow:hidden;word-break:keep-all;overflow-wrap:anywhere}
+.abt tr.hd{height:12mm}.abt tr.hd td{font-size:12.5pt}
+.abt td.st{vertical-align:top;padding:3pt 5pt;line-height:1.35}
+.abt td.muted{color:#64748B;font-weight:500}
+.abnote{font-size:9.5pt;margin-top:2mm;line-height:1.4}
+`;
 
 /* ------------------------- 일반 사용자용 파일 만들기 -------------------------
  * 지금 화면의 프로그램 코드 + 결과 데이터를 하나의 HTML로 묶는다.
@@ -587,17 +690,42 @@ async function githubError(r) {
   return `GitHub 오류 ${r.status}: ${m}`;
 }
 async function githubPut(gh, content, message) {
-  const path = gh.path.replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
-  const api = `https://api.github.com/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/contents/${path}`;
-  const headers = { Authorization: `Bearer ${gh.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  const owner = gh.owner.trim(), repo = gh.repo.trim();
+  const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const headers = { Authorization: `Bearer ${gh.token.trim()}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  const get = u => fetch(u, { headers, cache: 'no-store' });
+  // 1) 저장소 확인 — 안 보이면 토큰 소유자와 비교해 원인을 알려 준다
+  const rr = await get(base);
+  if (rr.status === 401) throw new Error('토큰이 올바르지 않거나 만료되었습니다. [토큰 변경]으로 새 토큰을 넣으세요.');
+  if (rr.status === 404) {
+    let who = ''; try { const u = await get('https://api.github.com/user'); if (u.ok) who = (await u.json()).login || ''; } catch (e) { /* 무시 */ }
+    if (who && who.toLowerCase() !== owner.toLowerCase()) throw new Error(`이 토큰의 계정은 '${who}'인데 사용자명이 '${owner}'로 되어 있습니다. 사용자명을 확인하세요.`);
+    throw new Error(`'${owner}/${repo}' 저장소에 이 토큰으로 접근할 수 없습니다.\n① 저장소 이름 철자(대소문자·하이픈)를 확인하세요.\n② 토큰의 Repository access가 'Only select repositories'라면 이 저장소가 선택되어 있어야 합니다. (토큰을 저장소보다 먼저 만들었다면 Edit에서 추가)`);
+  }
+  if (!rr.ok) throw new Error(await githubError(rr));
+  const info = await rr.json();
+  if (info.permissions && info.permissions.push === false) throw new Error('토큰에 쓰기 권한이 없습니다. 토큰 Permissions에서 Contents를 Read and write로 바꾸세요.');
+  // 2) 브랜치 확인 — 없으면 기본 브랜치, 빈 저장소면 첫 파일로 브랜치를 만든다
+  let branch = (gh.branch || '').trim() || info.default_branch;
+  let empty = false;
+  const br = await get(`${base}/branches/${encodeURIComponent(branch)}`);
+  if (br.status === 404) {
+    const db = info.default_branch && info.default_branch !== branch ? await get(`${base}/branches/${encodeURIComponent(info.default_branch)}`) : null;
+    if (db && db.ok) branch = info.default_branch; else empty = true;
+  }
+  // 3) 기존 파일이 있으면 sha를 받아 덮어쓴다
+  const path = gh.path.trim().replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
   let sha;
-  const g = await fetch(`${api}?ref=${encodeURIComponent(gh.branch)}`, { headers, cache: 'no-store' });
-  if (g.ok) sha = (await g.json()).sha; else if (g.status !== 404) throw new Error(await githubError(g));
-  const body = { message, branch: gh.branch, content: b64(new TextEncoder().encode(content)) };
+  if (!empty) {
+    const g = await get(`${base}/contents/${path}?ref=${encodeURIComponent(branch)}`);
+    if (g.ok) sha = (await g.json()).sha; else if (g.status !== 404) throw new Error(await githubError(g));
+  }
+  const body = { message, content: b64(new TextEncoder().encode(content)) };
+  if (!empty) body.branch = branch;
   if (sha) body.sha = sha;
-  const r = await fetch(api, { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await fetch(`${base}/contents/${path}`, { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) throw new Error(await githubError(r));
-  return r.json();
+  return { ...(await r.json()), usedBranch: empty ? info.default_branch || 'main' : branch, wasEmpty: empty };
 }
 function pagesLink(gh, version) {
   let base = (gh.pages || '').trim();
@@ -610,6 +738,7 @@ function pagesLink(gh, version) {
 /* ------------------------------ 웹 인쇄 ------------------------------ */
 const PRINT_CSS = `
 table{font-size:inherit}
+${ABS_CSS}
 .b4{width:364mm;height:256.5mm;box-sizing:border-box;padding:5.1mm 3.8mm;background:#fff;color:#000;font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;overflow:hidden}
 .b4title{display:flex;align-items:center;justify-content:center;font-weight:900;line-height:1}
 .cb{width:100%;border-collapse:collapse;table-layout:fixed}
@@ -622,6 +751,7 @@ table{font-size:inherit}
 .ovt th,.ovt td{border:1px solid #444;padding:3pt 4pt;vertical-align:middle;word-break:keep-all;overflow-wrap:anywhere;line-height:1.35}
 .ovt th{font-weight:700;text-align:center}.ovt tr.sum td{border-top:2.5px double #000;background:#FFF7D6}.ovt tr.sum td.gray{background:#F1F5F9}.ovt tr.sum td.lgray{background:#F2F2F2}
 .cfw{font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;color:#000;background:#fff}
+.cfsub{font-size:11pt;font-weight:700;text-align:center;color:#334155;margin:0 0 2pt}
 .cftitle{font-size:16pt;font-weight:900;text-align:center;margin:0 0 8pt}
 .cft{width:100%;border-collapse:collapse;table-layout:fixed}
 .cft th,.cft td{border:1px solid #444;padding:2.5pt 5pt;height:17pt;vertical-align:middle}
@@ -750,6 +880,9 @@ function App() {
   const [pv, setPv] = useState({ g: 3, c: 1, kind: '고정', day: 1, zoom: 'fit' });
   const [ov, setOv] = useState({ g: 3, c: 'all' });
   const [cf, setCf] = useState({ g: 3, c: 1 });
+  const [ab, setAb] = useState({ g: 3, c: 1, kind: '이동' });
+  const [exam, setExam] = useState(defaultExam);
+  const examTitle = examTitleOf(exam);
 
   const say = (text, type = 'success') => setMsg({ text, type });
 
@@ -779,11 +912,11 @@ function App() {
   const loadViewer = () => {
     const students = VIEWER.students.map(s => ({ ...s, takenNorm: new Set(s.taken.map(norm)) }));
     setRoster({ students, subjectsByGrade: VIEWER.subjectsByGrade, sheets: [], dup: 0, skipped: 0, unknownGrade: 0 });
-    setTT(VIEWER.tt); setCodes(VIEWER.codes); setMove(VIEWER.move); setSel(VIEWER.sel);
+    setTT(VIEWER.tt); setCodes(VIEWER.codes); setMove(VIEWER.move); setSel(VIEWER.sel); if (VIEWER.exam) setExam(VIEWER.exam);
     setSourceLabel(VIEWER.label);
     const gs = [...new Set(students.map(s => s.g))].sort();
     const g0 = gs[0] || 1, c0 = Math.min(...students.filter(s => s.g === g0).map(s => s.c));
-    setPv(p => ({ ...p, g: g0, c: c0 })); setOv({ g: g0, c: 'all' }); setCf({ g: g0, c: c0 });
+    setPv(p => ({ ...p, g: g0, c: c0 })); setOv({ g: g0, c: 'all' }); setCf({ g: g0, c: c0 }); setAb({ g: g0, c: c0, kind: '이동' });
     say(`일반 사용자용 화면입니다. 학년·학급을 골라 미리보기 후 인쇄하거나 칠판 부착물 엑셀을 내려받으세요. (자료 기준: ${VIEWER.createdAt})`, 'info');
   };
   // 관리자: 결과 데이터를 담은 일반 사용자용 HTML 파일 만들기
@@ -793,7 +926,7 @@ function App() {
     return {
       v: 1, createdAt: now.toLocaleString('ko-KR'), label: `${sourceLabel} (${now.toLocaleDateString('ko-KR')} 기준)`,
       students: students.map(({ g, c, n, id, name, gender, taken, excluded, reason }) => ({ g, c, n, id, name, gender, taken, excluded, reason })),
-      subjectsByGrade: roster.subjectsByGrade, tt, codes, move, sel,
+      subjectsByGrade: roster.subjectsByGrade, tt, codes, move, sel, exam,
     };
   };
   const makeViewerFile = () => { if (guard()) setShareOpen(true); };
@@ -809,6 +942,7 @@ function App() {
       if (cfg.move) setMove(m => ({ ...m, ...cfg.move }));
       if (cfg.tt) setTT(t => ({ ...t, ...cfg.tt }));
       if (cfg.codes) setCodes(c => ({ ...c, ...cfg.codes }));
+      if (cfg.exam) setExam(cfg.exam);
       // 저장해 둔 명단 원본이 있으면 그대로 다시 읽고, 없으면 샘플 명단
       const hasRoster = Array.isArray(cfg.sources) && cfg.sources.length > 0;
       applySources(hasRoster ? cfg.sources : sampleSources(), hasRoster ? cfg.label : '샘플 데이터 (1~3학년, 9개 학급)', kw, cfg.sel || {});
@@ -866,7 +1000,7 @@ function App() {
   // 명단 원본 + 시간표·과목코드·이동반·학급 선택·제외 키워드를 이 브라우저에 저장 (새로고침해도 유지)
   const saveConfig = () => {
     const savedAt = new Date().toLocaleString('ko-KR');
-    const base = { v: 9, savedAt, keywords, move, sel, tt, codes };
+    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam };
     const isSample = sourceLabel.startsWith('샘플 데이터');
     let ok = safeStorage.set(CONFIG_KEY, JSON.stringify(isSample ? base : { ...base, label: sourceLabel, sources: sourcesRef.current }));
     if (!ok) { // 저장 공간이 부족하면 명단을 빼고 설정만 저장
@@ -880,7 +1014,7 @@ function App() {
   const resetConfig = () => {
     if (!confirm('저장된 명단·시간표·설정을 모두 지우고 처음 상태로 되돌릴까요?\n(되돌릴 수 없습니다)')) return;
     safeStorage.remove(CONFIG_KEY);
-    setKeywords(DEFAULT_KEYWORDS);
+    setKeywords(DEFAULT_KEYWORDS); setExam(defaultExam());
     setMove({ 1: { ...DEFAULT_MOVE }, 2: { ...DEFAULT_MOVE }, 3: { ...DEFAULT_MOVE } });
     setTT(sampleTT()); setCodes(defaultCodes()); setSavedAt('');
     applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)', DEFAULT_KEYWORDS, {});
@@ -918,7 +1052,7 @@ function App() {
     const common = isCommon(g, sub), n = norm(sub);
     return df.filter(s => common || s.takenNorm.has(n)).map(s => s.n).sort((a, b) => a - b);
   };
-  const ctx = { selected, exams, tt, classStudents, move, takers };
+  const ctx = { selected, exams, tt, classStudents, move, takers, examTitle };
 
   /* ---------- 출력 ---------- */
   const guard = () => {
@@ -929,8 +1063,9 @@ function App() {
   };
   const exportFile = async (kind, targets) => {
     if (targets ? !students.length : !guard()) return;
-    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
+    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : kind === 3 ? '반별 결시 학생 현황 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
     try {
+      if (kind === 3) { const tg = targets || GRADES.flatMap(g => selected[g].map(c => [g, c])); await downloadWorkbook(buildAbsenceWorkbook(ctx, tg), tg.length === 1 ? `정기고사_결시현황_${tg[0][0]}학년${tg[0][1]}반_A4.xlsx` : `정기고사_반별_결시학생현황_A4.xlsx`); say('✅ [파일 3] 반별 결시 학생 현황(A4) 다운로드 완료!'); return; }
       if (kind === 1) { await downloadWorkbook(buildOverviewWorkbook(ctx), `정기고사_선택과목_응시현황_및_확인표.xlsx`); say('✅ [파일 1] 과목별 응시현황 및 응시확인표 다운로드 완료!'); }
       else { await downloadWorkbook(buildChalkboardWorkbook(ctx, targets || GRADES.flatMap(g => selected[g].map(c => [g, c]))), targets && targets.length === 1 ? `정기고사_칠판부착용_${targets[0][0]}학년${targets[0][1]}반_B4.xlsx` : `정기고사_칠판부착용_상세출력물_B4.xlsx`); say('✅ [파일 2] 칠판 부착용 상세 출력물(B4) 다운로드 완료!'); }
     } catch (err) { console.error(err); say(`엑셀 생성 오류: ${err.message}`, 'error'); }
@@ -973,7 +1108,23 @@ function App() {
       ${!VIEWER && html`
       <div className="xl:col-span-4 space-y-4">
         ${/* STEP 1 */''}
-        <${Card} step="1" title="학생 선택과목 명단 (1·2·3학년 동시)">
+        <${Card} step="1" title="시험 선택">
+          <div className="grid grid-cols-3 gap-2" id="examPick">
+            <label className="text-[11px] font-semibold text-slate-600">학년도
+              <select data-exam="year" value=${exam.year} onChange=${e => setExam(x => ({ ...x, year: +e.target.value }))} className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm font-normal">
+                ${[0, 1, 2, 3].map(i => defaultExam().year - 1 + i).map(y => html`<option key=${y} value=${y}>${y}학년도</option>`)}</select></label>
+            <label className="text-[11px] font-semibold text-slate-600">학기
+              <select data-exam="sem" value=${exam.sem} onChange=${e => setExam(x => ({ ...x, sem: +e.target.value }))} className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm font-normal">
+                ${[1, 2].map(v => html`<option key=${v} value=${v}>${v}학기</option>`)}</select></label>
+            <label className="text-[11px] font-semibold text-slate-600">차수
+              <select data-exam="round" value=${exam.round} onChange=${e => setExam(x => ({ ...x, round: +e.target.value }))} className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm font-normal">
+                ${[1, 2, 3, 4].map(v => html`<option key=${v} value=${v}>${v}차</option>`)}</select></label>
+          </div>
+          <div className="mt-2 text-center text-sm font-black text-indigo-800 bg-indigo-50 border border-indigo-200 rounded-lg py-2" id="examTitle">${examTitle}</div>
+          <p className="text-[11px] text-slate-500 mt-1.5">시간표 확인, 과목별 응시현황, 반별 응시확인표, 결시 학생 현황의 맨 위 제목에 들어갑니다.</p>
+        <//>
+
+        <${Card} step="2" title="학생 선택과목 명단 (1·2·3학년 동시)">
           <p className="text-[11px] text-slate-500 mb-3">학년별 파일 여러 개를 한꺼번에 고르거나, 학년별 시트가 있는 파일 하나를 올리세요. 학년은 학년 열 → 학번 → 시트명/파일명 순서로 자동 감지합니다.</p>
           <div className="grid grid-cols-2 gap-2">
             <label className=${`${btn} bg-indigo-600 hover:bg-indigo-500 text-white`}>⬆ 명단 업로드 (여러 개)
@@ -1000,7 +1151,7 @@ function App() {
           </div>
         <//>
 
-        <${Card} step="2" title="시험 시간표 및 과목코드 (학년별)">
+        <${Card} step="3" title="시험 시간표 및 과목코드 (학년별)">
           <p className="text-[11px] text-slate-500 mb-3">'1학년 시간표'~'3학년 시간표', '1학년 과목코드'~'3학년 과목코드' 시트가 있는 파일 하나를 올리세요. 업로드 후 [시간표 확인·수정] 탭에서 직접 고칠 수 있습니다.</p>
           <div className="grid grid-cols-2 gap-2">
             <label className=${`${btn} bg-emerald-600 hover:bg-emerald-500 text-white`}>⬆ 시간표 업로드
@@ -1012,7 +1163,7 @@ function App() {
           </div>
         <//>
 
-        <${Card} step="3" title="이동반 산정 방식 (학년별)">
+        <${Card} step="4" title="이동반 산정 방식 (학년별)">
           <p className="text-[11px] text-slate-500 mb-3">인원은 실제로 이동하는 학생 수입니다. 전출·위탁 등 제외 학생은 건너뛰고 셉니다. (예: 12번 결번, 앞번호 18명 → 1~19번 이동)</p>
           <div className="space-y-2">
             ${(presentGrades.length ? presentGrades : GRADES).map(g => html`<div key=${g} className="flex items-center gap-2 flex-wrap">
@@ -1026,7 +1177,7 @@ function App() {
           </div>
         <//>
 
-        <${Card} step="4" title="대상 학급 선택" right=${html`<div className="flex gap-1 text-[11px]">
+        <${Card} step="5" title="대상 학급 선택" right=${html`<div className="flex gap-1 text-[11px]">
             <button className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200" onClick=${() => setSel(s => Object.fromEntries(Object.keys(s).map(k => [k, true])))}>전체 선택</button>
             <button className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200" onClick=${() => setSel(s => Object.fromEntries(Object.keys(s).map(k => [k, false])))}>전체 해제</button></div>`}>
           <div className="flex border-b border-slate-200 mb-3" role="tablist">
@@ -1052,21 +1203,23 @@ function App() {
         <div className="space-y-2">
           <button id="export1" onClick=${() => exportFile(1)} disabled=${busy} className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">⬇ [파일 1] 과목별 응시현황 및 응시확인표</button>
           <button id="export2" onClick=${() => exportFile(2)} disabled=${busy} className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">🖨 [파일 2] 칠판 부착용 상세 출력물(B4)</button>
+          <button id="export3" onClick=${() => exportFile(3)} disabled=${busy} className="w-full bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">📋 [파일 3] 반별 결시 학생 현황(A4)</button>
         </div>
       </div>
 
       `}
       <div className=${`${VIEWER ? 'xl:col-span-12' : 'xl:col-span-8'} bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col min-w-0`}>
         <div className="flex flex-wrap gap-1 px-3 pt-3 border-b border-slate-200 bg-slate-50 rounded-t-xl">
-          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표']].filter(([k]) => !VIEWER || k !== 'timetable').map(([k, label]) => html`
+          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표'], ['absence', '📋 결시 학생 현황']].filter(([k]) => !VIEWER || k === 'chalkboard' || k === 'confirm').map(([k, label]) => html`
             <button key=${k} data-tab=${k} onClick=${() => setTab(k)} className=${`px-3.5 py-2 text-xs rounded-t-lg ${tab === k ? 'bg-white text-indigo-700 font-bold border border-b-white border-slate-200 -mb-px' : 'text-slate-600 hover:bg-slate-100'}`}>${label}</button>`)}
         </div>
         <div className="p-4 overflow-auto">
-          ${tab === 'timetable' && html`<${TimetableEditor} g=${ttGrade} setG=${setTTGrade} tt=${tt} codes=${codes} exams=${exams} roster=${roster} hasStudents=${students.length > 0}
+          ${tab === 'timetable' && html`<${TimetableEditor} examTitle=${examTitle} g=${ttGrade} setG=${setTTGrade} tt=${tt} codes=${codes} exams=${exams} roster=${roster} hasStudents=${students.length > 0}
               codeOf=${codeOf} isCommon=${isCommon} addSub=${addSub} removeSub=${removeSub} editTT=${editTT} />`}
           ${tab === 'chalkboard' && html`<${ChalkboardPreview} pv=${pv} setPv=${setPv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(2)} onExportClass=${t => exportFile(2, t)} busy=${busy} />`}
-          ${tab === 'overview' && html`<${OverviewPreview} ov=${ov} setOv=${setOv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
+          ${tab === 'overview' && !VIEWER && html`<${OverviewPreview} ov=${ov} setOv=${setOv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
           ${tab === 'confirm' && html`<${ConfirmPreview} cf=${cf} setCf=${setCf} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
+          ${tab === 'absence' && !VIEWER && html`<${AbsencePreview} ab=${ab} setAb=${setAb} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${t => exportFile(3, t)} busy=${busy} />`}
         </div>
       </div>
     </main>
@@ -1075,7 +1228,7 @@ function App() {
 }
 
 /* -------------------------- 시간표 확인·수정 탭 -------------------------- */
-function TimetableEditor({ g, setG, tt, codes, exams, roster, hasStudents, codeOf, isCommon, addSub, removeSub, editTT }) {
+function TimetableEditor({ examTitle, g, setG, tt, codes, exams, roster, hasStudents, codeOf, isCommon, addSub, removeSub, editTT }) {
   const t = tt[g];
   const days = Array.from({ length: t.days }, (_, i) => i + 1);
   const periods = Array.from({ length: t.periods }, (_, i) => i + 1);
@@ -1092,6 +1245,7 @@ function TimetableEditor({ g, setG, tt, codes, exams, roster, hasStudents, codeO
   const opt = (name, label, k) => html`<option key=${k} value=${name}>${label}${placed.has(norm(name)) ? ' ✓' : ''}</option>`;
 
   return html`<div>
+    <div className="text-center mb-3" id="ttTitle"><div className="text-xs font-bold text-slate-500">${examTitle}</div><div className="text-lg font-black">${g}학년 시험 시간표</div></div>
     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
       <${Seg} value=${g} onChange=${setG} options=${GRADES.map(x => [x, `${x}학년`])} />
       <div className="flex flex-wrap gap-1.5 text-[11px]">
@@ -1233,6 +1387,33 @@ function OverviewPreview({ ov, setOv, ctx, classesByGrade, presentGrades, onExpo
   </div>`;
 }
 
+/* --------------------------- 반별 결시 학생 현황 미리보기 --------------------------- */
+function AbsencePreview({ ab, setAb, ctx, classesByGrade, presentGrades, onExport, busy }) {
+  const { selected } = ctx;
+  const g = presentGrades.includes(ab.g) ? ab.g : presentGrades[0];
+  if (!g) return html`<p className="text-sm text-slate-400">명단을 먼저 업로드하세요.</p>`;
+  const c = classesByGrade[g].includes(ab.c) ? ab.c : classesByGrade[g][0];
+  const a = absenceData(g, c, ab.kind, ctx);
+  const selTargets = GRADES.flatMap(x => selected[x].map(y => [x, y]));
+  return html`<div>
+    <div className="flex flex-wrap items-center gap-3 mb-2">
+      <${GradeClassPicker} g=${g} c=${c} onChange=${(ng, nc) => setAb(x => ({ ...x, g: ng, c: nc }))} presentGrades=${presentGrades} classesByGrade=${classesByGrade} selected=${selected} />
+      <${Seg} value=${ab.kind} onChange=${v => setAb(x => ({ ...x, kind: v }))} options=${[['이동', '이동반'], ['고정', '고정반']]} size="xs" />
+      <span className="text-xs text-slate-600" id="abInfo">재적 <b>${a.df.length}명</b> · 재적번호 ${a.rangeText}${a.gaps.length ? ` · 결번 ${a.gaps.join(', ')}` : ''}</span>
+    </div>
+    <div className="flex flex-wrap gap-1.5 mb-3">
+      <button data-print="ab" disabled=${!a.df.length} onClick=${() => printPages([absenceHTML(a)], 'a4')} className=${`${pbtn} bg-slate-800 text-white`}>🖨 현재 페이지 인쇄 (A4)</button>
+      <button data-print="abclass" onClick=${() => printPages(absenceAllPages(ctx, [[g, c]]).map(absenceHTML), 'a4')} className=${`${pbtn} bg-slate-700 text-white`}>🖨 ${g}학년 ${c}반 인쇄 (이동·고정)</button>
+      <button data-print="aball" onClick=${() => printPages(absenceAllPages(ctx, selTargets).map(absenceHTML), 'a4')} className=${`${pbtn} bg-slate-600 text-white`}>🖨 선택 학급 모두 인쇄</button>
+      <button data-xl="abclass" onClick=${() => onExport([[g, c]])} disabled=${busy} className=${`${pbtn} bg-rose-600 text-white ml-auto`}>⬇ ${g}학년 ${c}반 엑셀</button>
+      <button data-xl="aball" onClick=${() => onExport()} disabled=${busy} className=${`${pbtn} bg-rose-700 text-white`}>⬇ 선택 학급 엑셀</button>
+    </div>
+    ${a.df.length ? html`<${ScaledPage} htmlStr=${`<div style="padding:10mm;background:#fff;height:297mm;box-sizing:border-box">${absenceHTML(a)}</div>`} widthPx=${210 * MM} heightPx=${297 * MM} zoom="fit" />`
+      : html`<p className="p-10 text-center text-slate-500 bg-slate-50 rounded-lg">${g}학년 ${c}반 ${ab.kind}반 학생이 없습니다.</p>`}
+    <p className="mt-2 text-[11px] text-slate-500">반별 이동반·고정반마다 A4 세로 1장입니다. 응시인원 칸 아래 빈 공간에 감독 교사가 결시자 번호·이름·사유를 적습니다.</p>
+  </div>`;
+}
+
 /* --------------------------- 반별 응시확인표 미리보기 --------------------------- */
 function ConfirmPreview({ cf, setCf, ctx, classesByGrade, presentGrades, onExport, busy }) {
   const { selected } = ctx;
@@ -1296,7 +1477,8 @@ function ShareDialog({ onClose, makePayload, say }) {
     setBusy(true); setErr(''); setLink('');
     try {
       const { html: h, payload } = await build();
-      await githubPut(gh, h, `정기시험 출력물 갱신 (${payload.createdAt})`);
+      const res = await githubPut(gh, h, `정기시험 출력물 갱신 (${payload.createdAt})`);
+      if (res.wasEmpty) setErr(`ℹ 빈 저장소라서 첫 파일로 '${res.usedBranch}' 브랜치를 만들었습니다. Settings → Pages에서 이 브랜치를 선택해야 링크가 열립니다.`);
       saveGh(gh);
       const l = pagesLink(gh, stamp(new Date()));
       setLink(l);
@@ -1358,7 +1540,7 @@ function ShareDialog({ onClose, makePayload, say }) {
         </div>`}
       </div>
 
-      ${err && html`<p id="shareErr" className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2.5 mb-3">${err}</p>`}
+      ${err && html`<p id="shareErr" className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2.5 mb-3" style=${{ whiteSpace: 'pre-line' }}>${err}</p>`}
       ${link && html`<div className="rounded-xl border-2 border-emerald-400 bg-emerald-50 p-4 mb-3">
         <div className="text-sm font-bold text-emerald-800 mb-2">✅ 올리기 완료 — 이 링크와 비밀번호를 전달하세요</div>
         <div className="flex gap-2"><input id="shareLink" readOnly value=${link} onFocus=${e => e.target.select()} className="flex-1 border border-emerald-300 rounded-md px-2 py-1.5 text-sm bg-white" />
