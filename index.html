@@ -1066,6 +1066,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [savedAt, setSavedAt] = useState('');
   const [shareOpen, setShareOpen] = useState(false);
+  const [cfgOpen, setCfgOpen] = useState(false);
   // 화면 상태
   const [tab, setTab] = useState(VIEWER ? 'chalkboard' : 'timetable');
   const [selGrade, setSelGrade] = useState(3);
@@ -1130,27 +1131,31 @@ function App() {
   };
   const makeViewerFile = () => { if (guard()) setShareOpen(true); };
 
+  // 저장된 작업 상태 적용 (빠진 항목은 기본값). 명단 원본이 있으면 true
+  const applyConfig = cfg => {
+    const kw = cfg.keywords || DEFAULT_KEYWORDS;
+    setKeywords(kw);
+    setMove({ 1: { ...DEFAULT_MOVE }, 2: { ...DEFAULT_MOVE }, 3: { ...DEFAULT_MOVE }, ...(cfg.move || {}) });
+    setTT({ ...sampleTT(), ...(cfg.tt || {}) });
+    setCodes({ ...defaultCodes(), ...(cfg.codes || {}) });
+    setExam(cfg.exam || defaultExam());
+    setTypes({ 1: {}, 2: {}, 3: {}, ...(cfg.types || {}) });
+    setThrState({ ...DEFAULT_THR, ...(cfg.thr || {}) });
+    setTimesState({ ...DEFAULT_TIMES, ...(cfg.times || {}) });
+    setEditors(cfg.editors || {});
+    setRoomOv(cfg.roomOv || {});
+    const hasRoster = Array.isArray(cfg.sources) && cfg.sources.length > 0;
+    applySources(hasRoster ? cfg.sources : sampleSources(), hasRoster ? cfg.label : '샘플 데이터 (1~3학년, 9개 학급)', kw, cfg.sel || {});
+    setSavedAt(cfg.savedAt || '');
+    return hasRoster;
+  };
   // 시작 시: 저장된 설정 복원 + 샘플 명단
   useEffect(() => {
     if (VIEWER) { loadViewer(); return; }
     let cfg = null;
     try { const raw = safeStorage.get(CONFIG_KEY); if (raw) cfg = JSON.parse(raw); } catch (e) { cfg = null; }
     if (cfg) {
-      const kw = cfg.keywords || DEFAULT_KEYWORDS;
-      setKeywords(kw);
-      if (cfg.move) setMove(m => ({ ...m, ...cfg.move }));
-      if (cfg.tt) setTT(t => ({ ...t, ...cfg.tt }));
-      if (cfg.codes) setCodes(c => ({ ...c, ...cfg.codes }));
-      if (cfg.exam) setExam(cfg.exam);
-      if (cfg.types) setTypes(t => ({ ...t, ...cfg.types }));
-      if (cfg.thr) setThrState(x => ({ ...x, ...cfg.thr }));
-      if (cfg.times) setTimesState(x => ({ ...x, ...cfg.times }));
-      if (cfg.editors) setEditors(cfg.editors);
-      if (cfg.roomOv) setRoomOv(cfg.roomOv);
-      // 저장해 둔 명단 원본이 있으면 그대로 다시 읽고, 없으면 샘플 명단
-      const hasRoster = Array.isArray(cfg.sources) && cfg.sources.length > 0;
-      applySources(hasRoster ? cfg.sources : sampleSources(), hasRoster ? cfg.label : '샘플 데이터 (1~3학년, 9개 학급)', kw, cfg.sel || {});
-      setSavedAt(cfg.savedAt || '');
+      const hasRoster = applyConfig(cfg);
       say(hasRoster ? `💾 마지막으로 저장한 상태(명단·시간표·설정)를 불러왔습니다. (저장 시각: ${cfg.savedAt || '-'})` : '저장된 설정을 불러왔습니다. 명단 파일을 업로드하세요.', 'info');
     } else loadSample();
   }, []);
@@ -1202,6 +1207,10 @@ function App() {
   };
 
   // 명단 원본 + 시간표·과목코드·이동반·학급 선택·제외 키워드를 이 브라우저에 저장 (새로고침해도 유지)
+  const buildConfig = savedAt => {
+    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv };
+    return sourceLabel.startsWith('샘플 데이터') ? base : { ...base, label: sourceLabel, sources: sourcesRef.current };
+  };
   const saveConfig = () => {
     const savedAt = new Date().toLocaleString('ko-KR');
     const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv };
@@ -1305,6 +1314,7 @@ function App() {
           <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-amber-400/20 text-amber-200 border border-amber-300/40">관리자</span>
           <button onClick=${loadSample} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">✨ 샘플 데이터 로드</button>
           <button id="saveBtn" onClick=${saveConfig} title=${savedAt ? `마지막 저장: ${savedAt}` : '아직 저장하지 않음'} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">💾 설정 저장</button>
+          <button id="cfgFileBtn" onClick=${() => setCfgOpen(true)} title="작업 상태를 파일로 백업하거나 다른 PC에서 불러오기" className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">📁 설정 파일</button>
           <button id="resetBtn" onClick=${resetConfig} className="bg-slate-800 hover:bg-rose-900 text-rose-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">🔄 설정 초기화</button>
           <button id="lockBtn" onClick=${lockAdmin} title="관리자 화면 잠그기 (다시 들어올 때 비밀번호 필요)" className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3 py-2.5 rounded-lg border border-slate-700">🔒</button>
           <button id="makeViewer" onClick=${makeViewerFile} className="bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold text-sm px-3.5 py-2.5 rounded-lg">📤 일반 사용자용 파일 만들기</button>`}
@@ -1442,6 +1452,7 @@ function App() {
         </div>
       </div>
     </main>
+    ${cfgOpen && html`<${ConfigFileDialog} onClose=${() => setCfgOpen(false)} buildConfig=${buildConfig} applyConfig=${applyConfig} say=${say} />`}
     ${shareOpen && html`<${ShareDialog} onClose=${() => setShareOpen(false)} makePayload=${makePayload} say=${say} />`}
   </div>`;
 }
@@ -1741,6 +1752,94 @@ function ConfirmPreview({ cf, setCf, ctx, classesByGrade, presentGrades, onExpor
       ${!VIEWER && html`<button onClick=${onExport} disabled=${busy} className=${`${pbtn} bg-indigo-600 text-white ml-auto`}>⬇ [파일 1] 엑셀 다운로드</button>`}
     </div>
     <${ScaledPage} htmlStr=${`<div style="padding:10mm;background:#fff;min-height:277mm;box-sizing:border-box">${htmlStr}</div>`} widthPx=${210 * MM} heightPx=${297 * MM} zoom="fit" />
+  </div>`;
+}
+
+/* ---------------------- 설정 파일 내보내기 / 불러오기 (관리자) ----------------------
+ * 작업 상태 전체(명단 원본·시간표·과목코드·통/선·이동반·학급 선택·기준·시간·출제자·고사실 구성·시험명)를
+ * .json 파일 하나로 저장했다가 다른 PC·브라우저에서 그대로 불러온다. 비밀번호를 넣으면 암호화. */
+const CFG_APP = 'exam-generator-config';
+function ConfigFileDialog({ onClose, buildConfig, applyConfig, say }) {
+  const [pw, setPw] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [ok, setOk] = useState('');
+  const [pending, setPending] = useState(null); // 암호화된 파일: 비밀번호 입력 대기
+  const [openPw, setOpenPw] = useState('');
+  const inp = 'w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm';
+  const pwErr = !pw ? '' : pw.length < 6 ? '6자 이상으로 정하세요.' : pw !== pw2 ? '두 비밀번호가 다릅니다.' : '';
+
+  const doExport = async () => {
+    if (pwErr) { setErr(pwErr); return; }
+    setBusy(true); setErr(''); setOk('');
+    try {
+      const now = new Date(), data = buildConfig(now.toLocaleString('ko-KR'));
+      const file = { app: CFG_APP, v: 1, exportedAt: now.toLocaleString('ko-KR'), title: examTitleOf(data.exam || defaultExam()) };
+      if (pw) { if (!cryptoReady()) throw new Error('이 브라우저에서는 암호화를 쓸 수 없습니다.'); file.enc = await encryptJSON(data, pw); } else file.data = data;
+      const blob = new Blob([JSON.stringify(file)], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob), a = document.createElement('a');
+      a.href = url; a.download = `정기시험_설정백업_${stamp(now)}.json`;
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setOk(`✅ 설정 파일을 내려받았습니다${pw ? ' (비밀번호 암호화)' : ''}. 다른 PC에서 [📁 설정 파일 → 불러오기]로 여세요.`);
+      say('📤 작업 상태를 설정 파일로 내보냈습니다.');
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const finish = (data, meta) => {
+    const hasRoster = applyConfig(data);
+    safeStorage.set(CONFIG_KEY, JSON.stringify(data)); // 이 브라우저에도 바로 저장 → 새로고침해도 유지
+    say(`📥 설정 파일을 불러왔습니다 (${meta.title || ''}, 백업 시각 ${meta.exportedAt || '-'})${hasRoster ? '' : ' · 명단은 들어 있지 않아 샘플로 표시합니다'}. 이 브라우저에도 저장했습니다.`);
+    onClose();
+  };
+  const onFile = async e => {
+    const f = e.target.files?.[0]; e.target.value = '';
+    if (!f) return;
+    setErr(''); setOk(''); setPending(null);
+    try {
+      const obj = JSON.parse(await f.text());
+      if (!obj || obj.app !== CFG_APP) throw new Error('이 프로그램의 설정 파일이 아닙니다.');
+      if (obj.enc) { setPending(obj); return; }
+      if (!obj.data) throw new Error('설정 내용이 비어 있습니다.');
+      if (confirm(`'${obj.title || '설정'}' (백업 시각 ${obj.exportedAt || '-'})을 불러올까요?\n지금 화면의 작업 내용은 이 파일 내용으로 바뀝니다.`)) finish(obj.data, obj);
+    } catch (x) { setErr(x instanceof SyntaxError ? '파일을 읽을 수 없습니다. (.json 설정 파일인지 확인하세요)' : x.message); }
+  };
+  const unlock = async e => {
+    e.preventDefault(); setBusy(true); setErr('');
+    try { const data = await decryptJSON(pending.enc, openPw); finish(data, pending); }
+    catch (x) { setErr('비밀번호가 맞지 않습니다.'); } finally { setBusy(false); }
+  };
+  return html`<div className="fixed inset-0 z-50 bg-slate-900/60 flex items-start justify-center p-4 overflow-auto" onClick=${e => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl mt-10 p-6" role="dialog" aria-label="설정 파일">
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-black">📁 설정 파일 내보내기 / 불러오기</h2>
+        <button onClick=${onClose} disabled=${busy} className="text-slate-400 hover:text-slate-700 text-xl">×</button>
+      </div>
+      <p className="text-xs text-slate-500 mb-4">명단·시간표·과목코드·통/선·이동반·학급 선택·감독 기준·교시 시간·출제자·고사실 구성·시험명을 파일 하나로 옮깁니다. GitHub 토큰은 들어가지 않습니다.</p>
+
+      <div className="rounded-xl border border-slate-200 p-4 mb-3">
+        <div className="text-sm font-bold mb-1">📤 내보내기 (백업)</div>
+        <p className="text-[11px] text-slate-500 mb-2">파일에 학생 명단이 들어갑니다. 메신저·USB로 옮길 때는 비밀번호를 거는 것을 권장합니다. (비워 두면 암호 없이 저장)</p>
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <input id="cfgPw" type="password" autoComplete="new-password" placeholder="비밀번호 (선택, 6자 이상)" value=${pw} onInput=${e => setPw(e.target.value)} className=${inp} />
+          <input id="cfgPw2" type="password" autoComplete="new-password" placeholder="비밀번호 확인" value=${pw2} onInput=${e => setPw2(e.target.value)} className=${inp} />
+        </div>
+        ${pwErr && html`<p className="text-[11px] text-rose-600 mb-2">${pwErr}</p>`}
+        <button id="cfgExport" onClick=${doExport} disabled=${busy} className="w-full py-2.5 rounded-lg bg-slate-900 text-white text-sm font-bold disabled:opacity-50">⬇ 설정 파일 내려받기${pw ? ' (암호)' : ''}</button>
+      </div>
+
+      <div className="rounded-xl border border-slate-200 p-4 mb-3">
+        <div className="text-sm font-bold mb-1">📥 불러오기 (복원)</div>
+        <p className="text-[11px] text-slate-500 mb-2">불러오면 지금 화면의 작업 내용이 파일 내용으로 바뀌고, 이 브라우저에도 바로 저장됩니다.</p>
+        ${pending ? html`<form onSubmit=${unlock} className="flex gap-2">
+            <input id="cfgOpenPw" type="password" autoFocus placeholder="백업할 때 정한 비밀번호" value=${openPw} onInput=${e => setOpenPw(e.target.value)} className=${inp} />
+            <button id="cfgUnlock" type="submit" disabled=${busy || !openPw} className="shrink-0 px-4 rounded-lg bg-indigo-600 text-white text-sm font-bold disabled:opacity-50">열기</button></form>
+            <p className="text-[11px] text-slate-500 mt-1">🔒 암호화된 설정 파일입니다. (${pending.title || ''} · 백업 ${pending.exportedAt || '-'})</p>`
+          : html`<label className="w-full flex items-center justify-center py-2.5 rounded-lg border-2 border-dashed border-slate-300 text-sm font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer">⬆ 설정 파일(.json) 선택
+            <input id="cfgImport" type="file" accept=".json,application/json" onChange=${onFile} className="hidden" /></label>`}
+      </div>
+      ${err && html`<p id="cfgErr" className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2.5">${err}</p>`}
+      ${ok && html`<p id="cfgOk" className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5">${ok}</p>`}
+    </div>
   </div>`;
 }
 
