@@ -639,6 +639,198 @@ const ABS_CSS = `
 .abnote{font-size:9.5pt;margin-top:2mm;line-height:1.4}
 `;
 
+/* ============================ 고사실 통계 (관리자) ============================
+ * 고사실 = 본반(고정반) 교실. 본반 학생 + 다른 학년 이동반 학생이 함께 시험을 본다.
+ * 교시마다 그 교실에서 실제 시험을 보는 인원을 세고, 본반·이동반 과목의 통(공통)/선(선택) 조합별
+ * 기준 인원 이상이면 색으로 표시한다 (통+통은 1명 배치라 제외). */
+const GUEST_OF = { 1: 3, 2: 1, 3: 2 }; // 1학년 교실 ← 3학년 이동반, 2학년 ← 1학년, 3학년 ← 2학년
+const DEFAULT_THR = { ts: 22, st: 25, ss: 19 };
+const DEFAULT_TIMES = { 1: '09:25 ~ 10:15', 2: '10:35 ~ 11:25', 3: '11:45 ~ 12:35', 4: '' };
+const COMBO = {
+  ts: { label: '본(통)+이(선)', short: '통+선', color: '#A0B4E6', argb: 'FFA0B4E6' },
+  st: { label: '본(선)+이(통)', short: '선+통', color: '#FFCEB0', argb: 'FFFFCEB0' },
+  ss: { label: '본(선)+이(선)', short: '선+선', color: '#9BE5C8', argb: 'FF9BE5C8' },
+};
+const comboKey = (bt, gt) => (bt === '통' && gt === '선' ? 'ts' : bt === '선' && gt === '통' ? 'st' : bt === '선' && gt === '선' ? 'ss' : null);
+
+// 기본 고사실 구성: 같은 반 번호의 지정 학년 이동반, 짝이 없는 이동반은 손님 없는 교실로
+function defaultRoomMap(classesByGrade) {
+  const map = {}, used = new Set();
+  GRADES.forEach(g => classesByGrade[g].forEach(c => {
+    const gg = GUEST_OF[g];
+    if (classesByGrade[gg].includes(c)) { map[clsKey(g, c)] = clsKey(gg, c); used.add(clsKey(gg, c)); } else map[clsKey(g, c)] = '';
+  }));
+  const left = GRADES.flatMap(g => classesByGrade[g].map(c => clsKey(g, c))).filter(k => !used.has(k));
+  GRADES.forEach(g => classesByGrade[g].forEach(c => {
+    const h = clsKey(g, c);
+    if (!map[h] && left.length) { const i = left.findIndex(k => +k.split('-')[1] === c); map[h] = left.splice(i >= 0 ? i : 0, 1)[0]; }
+  }));
+  return map;
+}
+
+function statsData(sx) {
+  const { ctx, classesByGrade, typeOf, thr, times, editors, roomMap, examTitle } = sx;
+  const { exams, tt, classStudents, move, takers } = ctx;
+  // 시험이 있는 (일차, 교시) — 전 학년 합집합
+  const slots = [];
+  const maxD = Math.max(...GRADES.map(g => tt[g].days)), maxP = Math.max(...GRADES.map(g => tt[g].periods));
+  for (let d = 1; d <= maxD; d++) for (let p = 1; p <= maxP; p++)
+    if (GRADES.some(g => exams[g].some(e => e.day === d && e.period === p))) slots.push({ d, p });
+  const dayLabel = d => { const g = GRADES.find(x => tt[x].labels[d]); return shortDate(g ? tt[g].labels[d] : '', d); };
+  const at = (g, s) => exams[g].filter(e => e.day === s.d && e.period === s.p);
+  const typeAt = (g, s) => { const l = at(g, s).filter(e => !e.self); return !l.length ? null : l.every(e => typeOf(g, e.sub) === '통') ? '통' : '선'; };
+  const count = (g, df, s) => at(g, s).filter(e => !e.self).reduce((a, e) => a + takers(g, df, e.sub).length, 0);
+  const parts = {}; // 'g-c' → {fixed, moved}
+  GRADES.forEach(g => classesByGrade[g].forEach(c => { parts[clsKey(g, c)] = splitClass(classStudents(g, c), move[g].dir, move[g].count); }));
+  const guestUse = {};
+  const blocks = GRADES.filter(g => classesByGrade[g].length).map(g => {
+    const rooms = classesByGrade[g].map(c => {
+      const hk = clsKey(g, c), gk = roomMap[hk] || '';
+      if (gk) guestUse[gk] = (guestUse[gk] || 0) + 1;
+      const host = parts[hk].fixed, gg = gk ? +gk.split('-')[0] : null, guest = gk && parts[gk] ? parts[gk].moved : [];
+      const cells = slots.map(s => {
+        const n = count(g, host, s) + (gk ? count(gg, guest, s) : 0);
+        const bt = typeAt(g, s), gt = gk ? typeAt(gg, s) : null;
+        const ck = bt && gt ? comboKey(bt, gt) : null;
+        const limit = ck ? thr[ck] : null;
+        return { n, ck, over: limit != null && limit > 0 && n >= limit };
+      });
+      return { g, c, host: hk, hostN: host.length, guest: gk, guestN: guest.length, total: host.length + guest.length, cells };
+    });
+    // 블록 대표 조합 (가장 흔한 손님 학년 기준)
+    const gc = {}; rooms.forEach(r => { if (r.guest) { const x = r.guest.split('-')[0]; gc[x] = (gc[x] || 0) + 1; } });
+    const mg = +(Object.keys(gc).sort((a, b) => gc[b] - gc[a])[0] || GUEST_OF[g]);
+    const types = slots.map(s => { const bt = typeAt(g, s), gt = typeAt(mg, s); return { bt, gt, label: bt && gt ? `${bt}+${gt}` : (bt || gt || '자습'), ck: bt && gt ? comboKey(bt, gt) : null }; });
+    return { g, guestGrade: mg, rooms, types };
+  });
+  const all = blocks.flatMap(b => b.rooms);
+  const totals = { hostN: all.reduce((a, r) => a + r.hostN, 0), guestN: all.reduce((a, r) => a + r.guestN, 0), total: all.reduce((a, r) => a + r.total, 0), cells: slots.map((s, i) => all.reduce((a, r) => a + r.cells[i].n, 0)) };
+  const overs = { ts: 0, st: 0, ss: 0 }; all.forEach(r => r.cells.forEach(x => { if (x.over) overs[x.ck]++; }));
+  const ttRows = slots.map(s => ({ ...s, date: dayLabel(s.d), time: times[s.p] || '', subs: GRADES.map(g => at(g, s).map(e => e.sub).join('/') || '') }));
+  const edRows = slots.map(s => ({ ...s, date: dayLabel(s.d), time: times[s.p] || '', cells: GRADES.map(g => { const l = at(g, s); return { has: l.some(e => !e.self), self: l.length > 0 && l.every(e => e.self), name: editors[`${g}-${s.d}-${s.p}`] || '' }; }) }));
+  const dupGuests = Object.keys(guestUse).filter(k => guestUse[k] > 1);
+  const unplaced = Object.keys(parts).filter(k => parts[k].moved.length && !guestUse[k]);
+  return { examTitle, slots, dayLabel, blocks, totals, overs, ttRows, edRows, thr, dupGuests, unplaced };
+}
+
+/* ---------- 화면·인쇄용 HTML (B4 가로 기준 폭 348mm) ---------- */
+function statsHTML(D) {
+  const days = []; D.slots.forEach(s => { const l = days[days.length - 1]; if (l && l.d === s.d) l.n++; else days.push({ d: s.d, n: 1 }); });
+  const th1 = days.map(x => `<th colspan="${x.n}" class="dh">${esc(D.dayLabel(x.d))}</th>`).join('');
+  const th2 = D.slots.map((s, i) => `<th class="ph${i > 0 && D.slots[i - 1].d !== s.d ? ' dl' : ''}">${s.p}교시</th>`).join('');
+  const dl = i => (i > 0 && D.slots[i - 1].d !== D.slots[i].d ? ' dl' : '');
+  const body = D.blocks.map(b => {
+    const typeRow = `<tr class="ty"><td colspan="5" class="tyl">교시별 과목 유형 (본 ${b.g}학년 + 이 ${b.guestGrade}학년)</td>${b.types.map((t, i) => `<td class="${dl(i)}"${t.ck ? ` style="color:${t.ck === 'ts' ? '#1d4ed8' : t.ck === 'st' ? '#c2410c' : '#047857'};font-weight:700"` : ''}>${esc(t.label)}</td>`).join('')}</tr>`;
+    const rows = b.rooms.map((r, ri) => `<tr>${ri === 0 ? `<td rowspan="${b.rooms.length + 1}" class="gl">${b.g}학년</td>` : ''}`
+      + `<td class="num">${r.total}</td><td>${r.host}</td><td class="num">${r.hostN}</td><td>${r.guest || '-'}</td><td class="num">${r.guest ? r.guestN : ''}</td>`
+      + r.cells.map((x, i) => `<td class="num${dl(i)}"${x.over ? ` style="background:${COMBO[x.ck].color};font-weight:800"` : ''}>${x.n || (x.n === 0 ? '<span class="z">0</span>' : '')}</td>`).join('') + '</tr>').join('');
+    return (b.rooms.length ? rows.replace('</tr>', '</tr>' + '') : '') + typeRow.replace('<tr class="ty">', '<tr class="ty">');
+  }).join('');
+  const tot = `<tr class="tot"><td>총계</td><td class="num">${D.totals.total}</td><td></td><td class="num">${D.totals.hostN}</td><td></td><td class="num">${D.totals.guestN}</td>${D.totals.cells.map((n, i) => `<td class="num${dl(i)}">${n}</td>`).join('')}</tr>`;
+  const ttb = D.ttRows.map((r, i) => `<tr>${i === 0 || D.ttRows[i - 1].d !== r.d ? `<td rowspan="${D.ttRows.filter(x => x.d === r.d).length}" class="b">${esc(r.date)}</td>` : ''}<td>${r.p}교시</td><td class="tm">${esc(r.time)}</td>${r.subs.map(x => `<td class="${x === SELF ? 'self' : ''}">${esc(x || '-')}</td>`).join('')}</tr>`).join('');
+  const edb = D.edRows.map((r, i) => `<tr>${i === 0 || D.edRows[i - 1].d !== r.d ? `<td rowspan="${D.edRows.filter(x => x.d === r.d).length}" class="b">${esc(r.date)}</td>` : ''}<td>${r.p}교시</td>${r.cells.map(x => `<td class="${x.has ? '' : 'self'}">${x.has ? esc(x.name) : x.self ? '자습' : '-'}</td>`).join('')}</tr>`).join('');
+  const thr = ['ts', 'st', 'ss'].map(k => `<td style="background:${COMBO[k].color}"><div class="cl">${COMBO[k].label}</div><div class="cv">${D.thr[k]}명 이상</div><div class="cc">${D.overs[k]}칸</div></td>`).join('');
+  return `<div class="stw"><div class="sttitle">${esc(D.examTitle)} 고사실별 응시 인원 통계</div>`
+    + `<div class="stgrid"><div class="stleft"><table class="stt"><thead><tr><th rowspan="2">학년</th><th rowspan="2">평가<br>재적</th><th rowspan="2">고정반<br>(본반)</th><th rowspan="2">재적</th><th rowspan="2">이동반</th><th rowspan="2">재적</th>${th1}</tr><tr>${th2}</tr></thead><tbody>${body}${tot}</tbody></table>`
+    + `<div class="stnote">· 숫자 = 해당 교시에 그 고사실에서 시험을 보는 인원(본반 응시자 + 이동반 응시자) · 색칠 = 감독 배치 기준 이상 · 통+통은 1명 배치로 기준 제외</div></div>`
+    + `<div class="stright"><div class="stbox"><div class="stbh">시험 시간표</div><table class="sts"><thead><tr><th>일차</th><th>교시</th><th>시간</th><th>1학년</th><th>2학년</th><th>3학년</th></tr></thead><tbody>${ttb}</tbody></table></div>`
+    + `<div class="stbox"><div class="stbh">감독 배치 기준 (본반+이동반 과목 유형)</div><table class="sts thr"><tr>${thr}</tr></table></div>`
+    + `<div class="stbox"><div class="stbh">출제(편집)자</div><table class="sts"><thead><tr><th>일차</th><th>교시</th><th>1학년</th><th>2학년</th><th>3학년</th></tr></thead><tbody>${edb}</tbody></table></div>`
+    + `</div></div></div>`;
+}
+const STATS_CSS = `
+.stw{font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;color:#000;background:#fff;width:348mm;font-size:9pt}
+.sttitle{font-size:16pt;font-weight:900;text-align:center;margin:0 0 4mm}
+.stgrid{display:flex;gap:4mm;align-items:flex-start}
+.stleft{flex:1 1 auto;min-width:0}.stright{flex:0 0 112mm;display:flex;flex-direction:column;gap:3mm}
+.stt{width:100%;border-collapse:collapse;table-layout:auto}
+.stt th,.stt td{border:1px solid #555;padding:1.2pt 2.5pt;text-align:center;white-space:nowrap;line-height:1.25}
+.stt thead th{background:#E7E6E6;font-weight:700}.stt th.dh{background:#DCE6F1}.stt th.ph{font-weight:600;background:#F2F2F2}
+.stt .dl{border-left:2px solid #000}.stt td.num{text-align:center}.stt td .z{color:#bbb}
+.stt td.gl{font-weight:800;background:#F8FAFC}
+.stt tr.ty td{background:#F8FAFC;font-size:7.5pt;color:#475569}.stt tr.ty td.tyl{text-align:right;padding-right:5pt}
+.stt tr.tot td{font-weight:800;background:#FFF7D6;border-top:2px solid #000}
+.stnote{font-size:7.5pt;color:#475569;margin-top:2mm}
+.stbox{border:1px solid #555}.stbh{background:#334155;color:#fff;font-weight:700;padding:2pt 5pt;font-size:9pt}
+.sts{width:100%;border-collapse:collapse}.sts th,.sts td{border:1px solid #999;padding:1.2pt 3pt;text-align:center;line-height:1.25;font-size:8pt}
+.sts thead th{background:#F2F2F2}.sts td.b{font-weight:700}.sts td.tm{white-space:nowrap;font-size:7.5pt}.sts td.self{color:#94a3b8}
+.sts.thr td{width:33.3%;padding:4pt}.sts .cl{font-size:8pt;font-weight:700}.sts .cv{font-size:13pt;font-weight:900}.sts .cc{font-size:7.5pt;color:#334155}
+`;
+
+/* ---------- 엑셀 (B4 가로 1장) ---------- */
+function buildStatsWorkbook(D) {
+  const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템'; wb.created = new Date();
+  const ws = wb.addWorksheet('고사실 통계', { pageSetup: { paperSize: 12, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 1, horizontalCentered: true, margins: { left: .25, right: .25, top: .3, bottom: .3, header: 0, footer: 0 } } });
+  const n = D.slots.length, R0 = 8 + n; // 오른쪽 패널 시작 열
+  const B = XL.border, C = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  // v === null 은 병합된 칸의 나머지 부분: 값·글꼴은 건드리지 않고 테두리·배경만 (병합 칸은 값을 공유하므로)
+  const cell = (r, c, v, o = {}) => {
+    const x = ws.getCell(r, c);
+    if (v !== null) { x.value = v; x.font = XL.font(o.size || 10, o.bold, o.color); x.alignment = o.align || C; }
+    if (o.border !== false) x.border = B; if (o.fill) x.fill = XL.fill(o.fill); return x;
+  };
+  [7, 7, 9, 6, 9, 6].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+  for (let i = 0; i < n; i++) ws.getColumn(7 + i).width = 6.2;
+  ws.getColumn(7 + n).width = 2;
+  [9, 7.5, 12, 15, 15, 15].forEach((w, i) => { ws.getColumn(R0 + i).width = w; });
+  // 제목
+  ws.mergeCells(1, 1, 1, R0 + 5); cell(1, 1, `${D.examTitle} 고사실별 응시 인원 통계`, { size: 18, bold: true, border: false }); ws.getRow(1).height = 34;
+  // 왼쪽 표 머리글 (3~4행)
+  ['학년', '평가\n재적', '고정반\n(본반)', '재적', '이동반', '재적'].forEach((t, i) => { ws.mergeCells(3, i + 1, 4, i + 1); cell(3, i + 1, t, { bold: true, fill: 'FFE7E6E6' }); cell(4, i + 1, null, { fill: 'FFE7E6E6' }); });
+  let col = 7; const days = []; D.slots.forEach(s => { const l = days[days.length - 1]; if (l && l.d === s.d) l.n++; else days.push({ d: s.d, n: 1 }); });
+  days.forEach(x => { if (x.n > 1) ws.mergeCells(3, col, 3, col + x.n - 1); for (let k = 0; k < x.n; k++) cell(3, col + k, k ? null : D.dayLabel(x.d), { bold: true, fill: 'FFDCE6F1' }); col += x.n; });
+  D.slots.forEach((s, i) => cell(4, 7 + i, `${s.p}교시`, { bold: true, fill: 'FFF2F2F2', size: 9 }));
+  ws.getRow(3).height = 20; ws.getRow(4).height = 18;
+  let r = 5;
+  D.blocks.forEach(b => {
+    const start = r;
+    b.rooms.forEach(rm => {
+      cell(r, 2, rm.total); cell(r, 3, rm.host); cell(r, 4, rm.hostN); cell(r, 5, rm.guest || '-'); cell(r, 6, rm.guest ? rm.guestN : '');
+      rm.cells.forEach((x, i) => cell(r, 7 + i, x.n, x.over ? { bold: true, fill: COMBO[x.ck].argb } : { color: x.n ? 'FF000000' : 'FFBBBBBB' }));
+      ws.getRow(r).height = 17; r++;
+    });
+    ws.mergeCells(r, 2, r, 6); cell(r, 2, `과목 유형 (본 ${b.g}학년 + 이 ${b.guestGrade}학년)`, { size: 8, color: 'FF475569', fill: 'FFF8FAFC', align: { vertical: 'middle', horizontal: 'right' } });
+    b.types.forEach((t, i) => cell(r, 7 + i, t.label, { size: 8, bold: !!t.ck, color: t.ck === 'ts' ? 'FF1D4ED8' : t.ck === 'st' ? 'FFC2410C' : t.ck === 'ss' ? 'FF047857' : 'FF64748B', fill: 'FFF8FAFC' }));
+    ws.getRow(r).height = 15; r++;
+    ws.mergeCells(start, 1, r - 1, 1); cell(start, 1, `${b.g}학년`, { bold: true, size: 12, fill: 'FFF8FAFC' });
+  });
+  const tf = 'FFFFF7D6';
+  cell(r, 1, '총계', { bold: true, fill: tf }); cell(r, 2, D.totals.total, { bold: true, fill: tf }); cell(r, 3, '', { fill: tf }); cell(r, 4, D.totals.hostN, { bold: true, fill: tf }); cell(r, 5, '', { fill: tf }); cell(r, 6, D.totals.guestN, { bold: true, fill: tf });
+  D.totals.cells.forEach((v, i) => cell(r, 7 + i, v, { bold: true, fill: tf })); ws.getRow(r).height = 19;
+  ws.mergeCells(r + 1, 1, r + 1, 6 + n);
+  cell(r + 1, 1, '· 숫자 = 해당 교시에 그 고사실에서 시험을 보는 인원(본반 응시자 + 이동반 응시자)   · 색칠 = 감독 배치 기준 이상   · 통+통은 1명 배치로 기준 제외', { size: 8, color: 'FF475569', border: false, align: { horizontal: 'left', vertical: 'middle' } });
+  // 오른쪽 ① 시험 시간표
+  let q = 3;
+  const head = (t, w) => { ws.mergeCells(q, R0, q, R0 + w - 1); cell(q, R0, t, { bold: true, color: 'FFFFFFFF', fill: 'FF334155' }); for (let k = 1; k < w; k++) cell(q, R0 + k, null, { fill: 'FF334155' }); ws.getRow(q).height = Math.max(ws.getRow(q).height || 0, 18); q++; };
+  head('시험 시간표', 6);
+  ['일차', '교시', '시간', '1학년', '2학년', '3학년'].forEach((t, i) => cell(q, R0 + i, t, { bold: true, size: 9, fill: 'FFF2F2F2' })); q++;
+  D.ttRows.forEach((x, i) => {
+    if (i === 0 || D.ttRows[i - 1].d !== x.d) { const k = D.ttRows.filter(y => y.d === x.d).length; if (k > 1) ws.mergeCells(q, R0, q + k - 1, R0); cell(q, R0, x.date, { bold: true, size: 9 }); }
+    else cell(q, R0, null);
+    cell(q, R0 + 1, `${x.p}교시`, { size: 9 }); cell(q, R0 + 2, x.time, { size: 8 });
+    x.subs.forEach((v, gi) => cell(q, R0 + 3 + gi, v || '-', { size: 8.5, color: v === SELF ? 'FF94A3B8' : 'FF000000' })); q++;
+  });
+  q++;
+  // ② 감독 배치 기준
+  head('감독 배치 기준 (본반+이동반 과목 유형) — 기준 이상이면 색 표시', 6);
+  ['ts', 'st', 'ss'].forEach((k, i) => {
+    const c0 = R0 + i * 2; ws.mergeCells(q, c0, q, c0 + 1); ws.mergeCells(q + 1, c0, q + 1, c0 + 1);
+    cell(q, c0, `${COMBO[k].label} · ${D.overs[k]}칸`, { bold: true, size: 9, fill: COMBO[k].argb }); cell(q, c0 + 1, null, { fill: COMBO[k].argb });
+    cell(q + 1, c0, `${D.thr[k]}명 이상`, { bold: true, size: 12, fill: COMBO[k].argb }); cell(q + 1, c0 + 1, null, { fill: COMBO[k].argb });
+  });
+  ws.getRow(q + 1).height = 22; q += 3;
+  // ③ 출제(편집)자
+  head('출제(편집)자', 6);
+  ['일차', '교시', '시간', '1학년', '2학년', '3학년'].forEach((t, i) => cell(q, R0 + i, t, { bold: true, size: 9, fill: 'FFF2F2F2' })); q++;
+  D.edRows.forEach((x, i) => {
+    if (i === 0 || D.edRows[i - 1].d !== x.d) { const k = D.edRows.filter(y => y.d === x.d).length; if (k > 1) ws.mergeCells(q, R0, q + k - 1, R0); cell(q, R0, x.date, { bold: true, size: 9 }); }
+    else cell(q, R0, null);
+    cell(q, R0 + 1, `${x.p}교시`, { size: 9 }); cell(q, R0 + 2, x.time, { size: 8 });
+    x.cells.forEach((c, gi) => cell(q, R0 + 3 + gi, c.has ? c.name : c.self ? '자습' : '-', { size: 9, color: c.has ? 'FF000000' : 'FF94A3B8' })); q++;
+  });
+  return wb;
+}
+
 /* ------------------------- 일반 사용자용 파일 만들기 -------------------------
  * 지금 화면의 프로그램 코드 + 결과 데이터를 하나의 HTML로 묶는다.
  * 그 파일을 열면 관리 기능 없이 미리보기·인쇄·칠판 엑셀 다운로드만 보인다.
@@ -677,7 +869,7 @@ async function decryptJSON(enc, pw) {
  * GitHub Contents API로 파일 하나를 만들거나 덮어쓴다 (토큰: Contents 읽기·쓰기 권한) */
 const GH_KEY = 'exam_generator_github_v1';
 // 기본 저장 위치 (토큰은 보안상 코드에 넣지 않고, 관리자 PC 브라우저에만 저장)
-const DEFAULT_GH = { owner: 'skyisonecolor-tech', repo: 'Elective-subjects', branch: 'main', path: 'viewer/index.html', pages: '' };
+const DEFAULT_GH = { owner: 'skyisonecolor', repo: 'Elective-subjects', branch: 'main', path: 'viewer/index.html', pages: '' };
 const loadGh = () => { let v = {}; try { v = JSON.parse(safeStorage.get(GH_KEY) || '{}'); } catch (e) { v = {}; } const o = { ...DEFAULT_GH, token: '' }; Object.keys(v).forEach(k => { if (v[k]) o[k] = v[k]; }); return o; };
 const saveGh = gh => safeStorage.set(GH_KEY, JSON.stringify({ owner: gh.owner.trim(), repo: gh.repo.trim(), branch: gh.branch.trim(), path: gh.path.trim(), pages: (gh.pages || '').trim(), token: (gh.token || '').trim() }));
 const maskToken = t => (t ? `${t.slice(0, 11)}…${t.slice(-4)}` : '');
@@ -739,6 +931,7 @@ function pagesLink(gh, version) {
 const PRINT_CSS = `
 table{font-size:inherit}
 ${ABS_CSS}
+${STATS_CSS}
 .b4{width:364mm;height:256.5mm;box-sizing:border-box;padding:5.1mm 3.8mm;background:#fff;color:#000;font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;overflow:hidden}
 .b4title{display:flex;align-items:center;justify-content:center;font-weight:900;line-height:1}
 .cb{width:100%;border-collapse:collapse;table-layout:fixed}
@@ -882,6 +1075,12 @@ function App() {
   const [cf, setCf] = useState({ g: 3, c: 1 });
   const [ab, setAb] = useState({ g: 3, c: 1, kind: '이동' });
   const [exam, setExam] = useState(defaultExam);
+  // 고사실 통계용 (관리자)
+  const [types, setTypes] = useState({ 1: {}, 2: {}, 3: {} }); // 과목별 통/선
+  const [thr, setThrState] = useState({ ...DEFAULT_THR });
+  const [times, setTimesState] = useState({ ...DEFAULT_TIMES });
+  const [editors, setEditors] = useState({});
+  const [roomOv, setRoomOv] = useState({});
   const examTitle = examTitleOf(exam);
 
   const say = (text, type = 'success') => setMsg({ text, type });
@@ -943,6 +1142,11 @@ function App() {
       if (cfg.tt) setTT(t => ({ ...t, ...cfg.tt }));
       if (cfg.codes) setCodes(c => ({ ...c, ...cfg.codes }));
       if (cfg.exam) setExam(cfg.exam);
+      if (cfg.types) setTypes(t => ({ ...t, ...cfg.types }));
+      if (cfg.thr) setThrState(x => ({ ...x, ...cfg.thr }));
+      if (cfg.times) setTimesState(x => ({ ...x, ...cfg.times }));
+      if (cfg.editors) setEditors(cfg.editors);
+      if (cfg.roomOv) setRoomOv(cfg.roomOv);
       // 저장해 둔 명단 원본이 있으면 그대로 다시 읽고, 없으면 샘플 명단
       const hasRoster = Array.isArray(cfg.sources) && cfg.sources.length > 0;
       applySources(hasRoster ? cfg.sources : sampleSources(), hasRoster ? cfg.label : '샘플 데이터 (1~3학년, 9개 학급)', kw, cfg.sel || {});
@@ -1000,7 +1204,7 @@ function App() {
   // 명단 원본 + 시간표·과목코드·이동반·학급 선택·제외 키워드를 이 브라우저에 저장 (새로고침해도 유지)
   const saveConfig = () => {
     const savedAt = new Date().toLocaleString('ko-KR');
-    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam };
+    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv };
     const isSample = sourceLabel.startsWith('샘플 데이터');
     let ok = safeStorage.set(CONFIG_KEY, JSON.stringify(isSample ? base : { ...base, label: sourceLabel, sources: sourcesRef.current }));
     if (!ok) { // 저장 공간이 부족하면 명단을 빼고 설정만 저장
@@ -1015,6 +1219,7 @@ function App() {
     if (!confirm('저장된 명단·시간표·설정을 모두 지우고 처음 상태로 되돌릴까요?\n(되돌릴 수 없습니다)')) return;
     safeStorage.remove(CONFIG_KEY);
     setKeywords(DEFAULT_KEYWORDS); setExam(defaultExam());
+    setTypes({ 1: {}, 2: {}, 3: {} }); setThrState({ ...DEFAULT_THR }); setTimesState({ ...DEFAULT_TIMES }); setEditors({}); setRoomOv({});
     setMove({ 1: { ...DEFAULT_MOVE }, 2: { ...DEFAULT_MOVE }, 3: { ...DEFAULT_MOVE } });
     setTT(sampleTT()); setCodes(defaultCodes()); setSavedAt('');
     applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)', DEFAULT_KEYWORDS, {});
@@ -1053,6 +1258,15 @@ function App() {
     return df.filter(s => common || s.takenNorm.has(n)).map(s => s.n).sort((a, b) => a - b);
   };
   const ctx = { selected, exams, tt, classStudents, move, takers, examTitle };
+  const typeOf = (g, sub) => (types[g] && types[g][norm(sub)]) || (isCommon(g, sub) ? '통' : '선');
+  const setType = (g, sub, v) => setTypes(t => ({ ...t, [g]: { ...(t[g] || {}), [norm(sub)]: v } }));
+  const roomMap = useMemo(() => {
+    const m = defaultRoomMap(classesByGrade);
+    Object.keys(roomOv).forEach(k => { if (k in m) m[k] = roomOv[k]; });
+    return m;
+  }, [classesByGrade, roomOv]);
+  const sx = { ctx, classesByGrade, typeOf, thr, times, editors, roomMap, examTitle };
+  const statsD = tab === 'stats' || busy ? statsData(sx) : null;
 
   /* ---------- 출력 ---------- */
   const guard = () => {
@@ -1063,8 +1277,9 @@ function App() {
   };
   const exportFile = async (kind, targets) => {
     if (targets ? !students.length : !guard()) return;
-    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : kind === 3 ? '반별 결시 학생 현황 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
+    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : kind === 3 ? '반별 결시 학생 현황 엑셀 생성 중...' : kind === 4 ? '고사실 통계 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
     try {
+      if (kind === 4) { await downloadWorkbook(buildStatsWorkbook(statsData(sx)), `정기고사_고사실별_응시인원_통계_B4.xlsx`); say('✅ [파일 4] 고사실 통계(B4) 다운로드 완료!'); return; }
       if (kind === 3) { const tg = targets || GRADES.flatMap(g => selected[g].map(c => [g, c])); await downloadWorkbook(buildAbsenceWorkbook(ctx, tg), tg.length === 1 ? `정기고사_결시현황_${tg[0][0]}학년${tg[0][1]}반_A4.xlsx` : `정기고사_반별_결시학생현황_A4.xlsx`); say('✅ [파일 3] 반별 결시 학생 현황(A4) 다운로드 완료!'); return; }
       if (kind === 1) { await downloadWorkbook(buildOverviewWorkbook(ctx), `정기고사_선택과목_응시현황_및_확인표.xlsx`); say('✅ [파일 1] 과목별 응시현황 및 응시확인표 다운로드 완료!'); }
       else { await downloadWorkbook(buildChalkboardWorkbook(ctx, targets || GRADES.flatMap(g => selected[g].map(c => [g, c]))), targets && targets.length === 1 ? `정기고사_칠판부착용_${targets[0][0]}학년${targets[0][1]}반_B4.xlsx` : `정기고사_칠판부착용_상세출력물_B4.xlsx`); say('✅ [파일 2] 칠판 부착용 상세 출력물(B4) 다운로드 완료!'); }
@@ -1204,21 +1419,25 @@ function App() {
           <button id="export1" onClick=${() => exportFile(1)} disabled=${busy} className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">⬇ [파일 1] 과목별 응시현황 및 응시확인표</button>
           <button id="export2" onClick=${() => exportFile(2)} disabled=${busy} className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">🖨 [파일 2] 칠판 부착용 상세 출력물(B4)</button>
           <button id="export3" onClick=${() => exportFile(3)} disabled=${busy} className="w-full bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">📋 [파일 3] 반별 결시 학생 현황(A4)</button>
+          <button id="export4" onClick=${() => exportFile(4)} disabled=${busy} className="w-full bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl shadow">📈 [파일 4] 고사실별 응시 인원 통계(B4)</button>
         </div>
       </div>
 
       `}
       <div className=${`${VIEWER ? 'xl:col-span-12' : 'xl:col-span-8'} bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col min-w-0`}>
         <div className="flex flex-wrap gap-1 px-3 pt-3 border-b border-slate-200 bg-slate-50 rounded-t-xl">
-          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표'], ['absence', '📋 결시 학생 현황']].filter(([k]) => !VIEWER || k === 'chalkboard' || k === 'confirm').map(([k, label]) => html`
+          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표'], ['absence', '📋 결시 학생 현황'], ['stats', '📈 고사실 통계']].filter(([k]) => !VIEWER || k === 'chalkboard' || k === 'confirm').map(([k, label]) => html`
             <button key=${k} data-tab=${k} onClick=${() => setTab(k)} className=${`px-3.5 py-2 text-xs rounded-t-lg ${tab === k ? 'bg-white text-indigo-700 font-bold border border-b-white border-slate-200 -mb-px' : 'text-slate-600 hover:bg-slate-100'}`}>${label}</button>`)}
         </div>
         <div className="p-4 overflow-auto">
-          ${tab === 'timetable' && html`<${TimetableEditor} examTitle=${examTitle} g=${ttGrade} setG=${setTTGrade} tt=${tt} codes=${codes} exams=${exams} roster=${roster} hasStudents=${students.length > 0}
+          ${tab === 'timetable' && html`<${TimetableEditor} typeOf=${typeOf} setType=${setType} examTitle=${examTitle} g=${ttGrade} setG=${setTTGrade} tt=${tt} codes=${codes} exams=${exams} roster=${roster} hasStudents=${students.length > 0}
               codeOf=${codeOf} isCommon=${isCommon} addSub=${addSub} removeSub=${removeSub} editTT=${editTT} />`}
           ${tab === 'chalkboard' && html`<${ChalkboardPreview} pv=${pv} setPv=${setPv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(2)} onExportClass=${t => exportFile(2, t)} busy=${busy} />`}
           ${tab === 'overview' && !VIEWER && html`<${OverviewPreview} ov=${ov} setOv=${setOv} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
           ${tab === 'confirm' && html`<${ConfirmPreview} cf=${cf} setCf=${setCf} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${() => exportFile(1)} busy=${busy} />`}
+          ${tab === 'stats' && !VIEWER && statsD && html`<${StatsTab} sx=${sx} D=${statsD} classesByGrade=${classesByGrade} busy=${busy} onExport=${() => exportFile(4)}
+              setThr=${(k, v) => setThrState(x => ({ ...x, [k]: v }))} setTimes=${(pp, v) => setTimesState(x => ({ ...x, [pp]: v }))}
+              setEditor=${(k, v) => setEditors(x => ({ ...x, [k]: v }))} setRoom=${(hk, v) => setRoomOv(x => ({ ...x, [hk]: v }))} resetRooms=${() => setRoomOv({})} />`}
           ${tab === 'absence' && !VIEWER && html`<${AbsencePreview} ab=${ab} setAb=${setAb} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${t => exportFile(3, t)} busy=${busy} />`}
         </div>
       </div>
@@ -1228,7 +1447,7 @@ function App() {
 }
 
 /* -------------------------- 시간표 확인·수정 탭 -------------------------- */
-function TimetableEditor({ examTitle, g, setG, tt, codes, exams, roster, hasStudents, codeOf, isCommon, addSub, removeSub, editTT }) {
+function TimetableEditor({ typeOf, setType, examTitle, g, setG, tt, codes, exams, roster, hasStudents, codeOf, isCommon, addSub, removeSub, editTT }) {
   const t = tt[g];
   const days = Array.from({ length: t.days }, (_, i) => i + 1);
   const periods = Array.from({ length: t.periods }, (_, i) => i + 1);
@@ -1277,6 +1496,9 @@ function TimetableEditor({ examTitle, g, setG, tt, codes, exams, roster, hasStud
                 return html`<div key=${s} className=${`relative rounded-md px-2 py-1 pr-5 border ${self ? 'bg-slate-100 border-slate-300 text-slate-500' : !code ? 'bg-amber-50 border-amber-300' : 'bg-indigo-50 border-indigo-200 text-indigo-900'}`}>
                   <div className="font-semibold leading-tight">${s}</div>
                   <div className="text-[10px] opacity-75">${self ? '자습 · 시험 없음' : code ? `코드 ${code}` : '코드 없음'}${cm ? ' · 전원 응시' : ''}</div>
+                  ${!self && html`<div className="mt-1 inline-flex rounded-md overflow-hidden border border-slate-300 bg-white" role="group" data-type=${s}>
+                    ${['통', '선'].map(v => html`<button key=${v} type="button" title=${v === '통' ? '공통과목' : '선택과목'} onClick=${() => setType(g, s, v)}
+                      className=${`px-2 py-0.5 text-[10px] font-bold ${typeOf(g, s) === v ? (v === '통' ? 'bg-sky-600 text-white' : 'bg-violet-600 text-white') : 'text-slate-500 hover:bg-slate-50'}`}>${v === '통' ? '통(공통)' : '선(선택)'}</button>`)}</div>`}
                   <button title="삭제" onClick=${() => removeSub(g, d, p, s)} className="absolute top-0.5 right-1 text-slate-400 hover:text-rose-600 font-bold">×</button></div>`; })}
               <select value="" onChange=${e => { if (e.target.value) addSub(g, d, p, e.target.value); }} className="tt-select w-full border border-dashed border-slate-300 rounded px-1 py-1 text-slate-500 bg-white">
                 <option value="">+ 과목 추가</option>
@@ -1291,6 +1513,7 @@ function TimetableEditor({ examTitle, g, setG, tt, codes, exams, roster, hasStud
     <div className="mt-3 space-y-1.5 text-[11px]" id="ttWarnings">
       ${noCode.length > 0 && html`<p className="text-amber-700">⚠ 과목코드가 없는 과목: ${noCode.join(', ')} → '${g}학년 과목코드' 시트에 추가하세요.</p>`}
       ${dups.length > 0 && html`<p className="text-amber-700">⚠ 두 번 이상 배치된 과목: ${dups.join(', ')}</p>`}
+      <p className="text-slate-500">ℹ 각 과목의 <b>통(공통)/선(선택)</b> 버튼은 고사실 통계의 감독 배치 기준(본반+이동반 조합)에 쓰입니다. 처음에는 명단에 열이 없는 과목을 통, 있는 과목을 선으로 둡니다.</p>
       ${common.length > 0 && html`<p className="text-sky-700">ℹ 명단에 해당 과목 열이 없어 <b>학년 전원 응시(공통과목)</b>로 처리: ${common.join(', ')}</p>`}
       ${hasStudents && notScheduled.length > 0 && html`<p className="text-slate-500">ℹ 명단에는 있지만 시간표에 없는 과목: ${notScheduled.join(', ')}</p>`}
     </div>
@@ -1384,6 +1607,92 @@ function OverviewPreview({ ov, setOv, ctx, classesByGrade, presentGrades, onExpo
     </div>
     ${htmlStr ? html`<div className="overflow-x-auto" id="ovPreview" dangerouslySetInnerHTML=${{ __html: htmlStr }} />`
       : html`<p className="p-10 text-center text-slate-400">${g}학년: 시험 과목 또는 선택 학급이 없습니다.</p>`}
+  </div>`;
+}
+
+/* ------------------------------ 고사실 통계 탭 (관리자) ------------------------------ */
+// 내용 폭에 맞춰 축소해 보여 주는 상자
+function FitWidth({ htmlStr, designPx }) {
+  const ref = useRef(null);
+  const [w, setW] = useState(900);
+  useEffect(() => { const el = ref.current; if (!el) return; const ro = new ResizeObserver(() => setW(el.clientWidth)); ro.observe(el); return () => ro.disconnect(); }, []);
+  const z = Math.min(1, (w - 24) / designPx);
+  return html`<div ref=${ref} className="bg-slate-200 rounded-lg p-3 overflow-auto">
+    <div className="bg-white shadow-lg p-3 mx-auto" style=${{ width: designPx * z + 24 }}><div style=${{ zoom: z }} dangerouslySetInnerHTML=${{ __html: htmlStr }} /></div></div>`;
+}
+// 접었다 펼 수 있는 구역 (입력칸이 다시 그려지며 포커스를 잃지 않도록 바깥에 정의)
+function Section({ open, onToggle, title, sub, children }) {
+  return html`<div className="border border-slate-200 rounded-xl">
+    <button onClick=${onToggle} className="w-full flex items-center justify-between px-4 py-2.5 text-left">
+      <span className="text-sm font-bold text-slate-800">${title} <span className="font-normal text-xs text-slate-500">${sub}</span></span><span className="text-slate-400 text-xs">${open ? '접기 ▲' : '열기 ▼'}</span></button>
+    ${open && html`<div className="px-4 pb-4">${children}</div>`}</div>`;
+}
+function StatsTab({ sx, D, setThr, setTimes, setEditor, setRoom, resetRooms, classesByGrade, onExport, busy }) {
+  const [openSec, setOpenSec] = useState({ editors: false, rooms: false });
+  const tog = k => setOpenSec(o => ({ ...o, [k]: !o[k] }));
+  const maxP = Math.max(1, ...D.slots.map(s => s.p));
+  const guestOptions = GRADES.flatMap(g => classesByGrade[g].map(c => clsKey(g, c)));
+  const totalOver = D.overs.ts + D.overs.st + D.overs.ss;
+  if (!D.blocks.length || !D.slots.length) return html`<p className="p-10 text-center text-slate-400">명단과 시험 시간표를 먼저 입력하세요.</p>`;
+  return html`<div className="space-y-3">
+    <div className="flex flex-wrap items-center gap-2" id="statsSummary">
+      <span className="text-xs px-3 py-1.5 rounded-full bg-slate-100 text-slate-700 font-semibold">고사실 ${D.blocks.reduce((a, b) => a + b.rooms.length, 0)}곳 · 시험 교시 ${D.slots.length}개</span>
+      <span className=${`text-xs px-3 py-1.5 rounded-full font-semibold ${totalOver ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>기준 이상 ${totalOver}칸</span>
+      ${['ts', 'st', 'ss'].map(k => html`<span key=${k} className="text-xs px-2.5 py-1.5 rounded-full font-semibold" style=${{ background: COMBO[k].color }}>${COMBO[k].label} ${D.overs[k]}</span>`)}
+      ${D.dupGuests.length > 0 && html`<span className="text-xs text-rose-600 font-semibold">⚠ 두 교실에 배치된 이동반: ${D.dupGuests.join(', ')}</span>`}
+      ${D.unplaced.length > 0 && html`<span className="text-xs text-amber-700 font-semibold">⚠ 교실이 없는 이동반: ${D.unplaced.join(', ')}</span>`}
+    </div>
+
+    <div className="grid md:grid-cols-2 gap-3">
+      <div className="border border-slate-200 rounded-xl p-4">
+        <div className="text-sm font-bold text-slate-800 mb-1">감독 배치 기준 인원</div>
+        <p className="text-[11px] text-slate-500 mb-3">본반(고정반)과 이동반 과목의 통·선 조합별로, 고사실 응시 인원이 이 수 <b>이상</b>이면 표에 색으로 표시합니다. 통+통은 1명 배치라 제외합니다.</p>
+        <div className="grid grid-cols-3 gap-2">
+          ${['ts', 'st', 'ss'].map(k => html`<label key=${k} className="rounded-lg p-2.5 text-center" style=${{ background: COMBO[k].color }}>
+            <div className="text-[11px] font-bold text-slate-800">${COMBO[k].label}</div>
+            <div className="flex items-center justify-center gap-1 mt-1.5"><input type="number" min="0" max="99" data-thr=${k} value=${sx.thr[k]} onInput=${e => setThr(k, Math.max(0, parseInt(e.target.value) || 0))} className="w-16 text-center text-lg font-black rounded-md border border-white/70 bg-white/80 py-0.5" /><span className="text-xs font-semibold">명↑</span></div>
+          </label>`)}
+        </div>
+      </div>
+      <div className="border border-slate-200 rounded-xl p-4">
+        <div className="text-sm font-bold text-slate-800 mb-1">교시별 시험 시간</div>
+        <p className="text-[11px] text-slate-500 mb-3">통계표 오른쪽 시험 시간표에 표시됩니다.</p>
+        <div className="space-y-1.5">
+          ${Array.from({ length: maxP }, (_, i) => i + 1).map(p => html`<label key=${p} className="flex items-center gap-2 text-xs"><span className="w-10 font-bold text-slate-600">${p}교시</span>
+            <input data-time=${p} value=${sx.times[p] || ''} placeholder="예: 09:25 ~ 10:15" onInput=${e => setTimes(p, e.target.value)} className="flex-1 border border-slate-300 rounded-md px-2 py-1" /></label>`)}
+        </div>
+      </div>
+    </div>
+
+    <${Section} open=${openSec.editors} onToggle=${() => tog('editors')} title="출제(편집)자 입력" sub=${`· ${D.edRows.reduce((a, r) => a + r.cells.filter(c => c.has && c.name).length, 0)} / ${D.edRows.reduce((a, r) => a + r.cells.filter(c => c.has).length, 0)}칸 입력됨`}>
+      <table className="w-full text-xs border-collapse" id="editorTable"><thead><tr className="bg-slate-50 text-slate-600"><th className="py-1.5 border border-slate-200 w-24">일차</th><th className="border border-slate-200 w-14">교시</th>${GRADES.map(g => html`<th key=${g} className="border border-slate-200">${g}학년</th>`)}</tr></thead>
+        <tbody>${D.edRows.map((r, i) => html`<tr key=${r.d + '-' + r.p}>
+          ${(i === 0 || D.edRows[i - 1].d !== r.d) && html`<td rowSpan=${D.edRows.filter(x => x.d === r.d).length} className="border border-slate-200 text-center font-bold">${r.date}</td>`}
+          <td className="border border-slate-200 text-center">${r.p}교시</td>
+          ${r.cells.map((c, gi) => html`<td key=${gi} className="border border-slate-200 p-1">${c.has
+            ? html`<input data-ed=${`${gi + 1}-${r.d}-${r.p}`} value=${c.name} placeholder=${D.ttRows[i].subs[gi]} onInput=${e => setEditor(`${gi + 1}-${r.d}-${r.p}`, e.target.value)} className="w-full border border-slate-200 rounded px-1.5 py-1" />`
+            : html`<div className="text-center text-slate-300">${c.self ? '자습' : '-'}</div>`}</td>`)}
+        </tr>`)}</tbody></table>
+      <p className="text-[11px] text-slate-500 mt-1.5">같은 교시에 과목이 2개면 '나재영/최도연'처럼 슬래시로 적으세요. 입력칸의 흐린 글씨는 그 교시 과목명입니다.</p>
+    <//>
+
+    <${Section} open=${openSec.rooms} onToggle=${() => tog('rooms')} title="고사실 구성 (이동반 배치)" sub="· 기본: 1학년 교실←3학년 이동반, 2학년 교실←1학년 이동반, 3학년 교실←2학년 이동반 (같은 반 번호)">
+      <div className="flex justify-end mb-2"><button onClick=${resetRooms} className="text-[11px] px-2.5 py-1 rounded-md border border-slate-300 hover:bg-slate-50">기본 배치로 되돌리기</button></div>
+      <div className="grid sm:grid-cols-3 gap-3">
+        ${GRADES.filter(g => classesByGrade[g].length).map(g => html`<div key=${g}><div className="text-xs font-bold text-slate-700 mb-1">${g}학년 교실</div>
+          <div className="space-y-1">${classesByGrade[g].map(c => { const hk = clsKey(g, c); return html`<label key=${hk} className="flex items-center gap-2 text-xs">
+            <span className="w-12 font-semibold">${hk}</span><span className="text-slate-400">←</span>
+            <select data-room=${hk} value=${sx.roomMap[hk] || ''} onChange=${e => setRoom(hk, e.target.value)} className=${`flex-1 border rounded-md px-1.5 py-1 ${D.dupGuests.includes(sx.roomMap[hk]) ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}>
+              <option value="">이동반 없음</option>${guestOptions.filter(k => +k.split('-')[0] !== g).map(k => html`<option key=${k} value=${k}>${k} 이동반</option>`)}</select></label>`; })}</div></div>`)}
+      </div>
+    <//>
+
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className="text-sm font-bold text-slate-800 mr-auto">미리보기 <span className="text-xs font-normal text-slate-500">B4 가로 1장</span></span>
+      <button data-print="stats" onClick=${() => printPages([statsHTML(D)], 'b4ov')} className=${`${pbtn} bg-slate-800 text-white`}>🖨 인쇄 (B4 가로)</button>
+      <button data-xl="stats" onClick=${onExport} disabled=${busy} className=${`${pbtn} bg-violet-600 text-white`}>⬇ 엑셀 다운로드 (B4)</button>
+    </div>
+    <${FitWidth} htmlStr=${statsHTML(D)} designPx=${348 * MM} />
   </div>`;
 }
 
