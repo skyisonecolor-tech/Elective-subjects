@@ -593,12 +593,45 @@ function absenceAllPages(ctx, targets) {
   targets.forEach(([g, c]) => ['이동', '고정'].forEach(kind => { const a = absenceData(g, c, kind, ctx); if (a.df.length) out.push(a); }));
   return out;
 }
+// 고사실(본반 교실) = 앞면 그 반 고정반 + 뒷면 고사실 구성에서 그 교실로 오는 이동반
+function absenceRoomPairs(ctx, roomMap, hosts) {
+  return hosts.map(([g, c]) => {
+    const room = clsKey(g, c), gk = roomMap[room] || '';
+    const front = absenceData(g, c, '고정', ctx);
+    let back = null;
+    if (gk) { const [gg, cc] = gk.split('-').map(Number); const b = absenceData(gg, cc, '이동', ctx); if (b.df.length) back = b; }
+    return { room, front, back };
+  }).filter(r => r.front.df.length || r.back);
+}
+// flip: 긴 쪽 넘김 프린터에서 상철이 되도록 뒷면을 180° 돌린다
+function absenceRoomPrintPages(pairs, flip) {
+  const blank = `<div style="width:190mm;height:30mm;color:#94a3b8;font:10pt 'Malgun Gothic',sans-serif;text-align:center;padding-top:20mm">(이 고사실로 오는 이동반 없음 — 빈 면)</div>`;
+  return pairs.flatMap(r => {
+    const back = r.back ? absenceHTML(r.back) : blank;
+    return [absenceHTML(r.front), flip ? `<div style="width:190mm;height:268mm;transform:rotate(180deg);overflow:hidden">${back}</div>` : back];
+  });
+}
 // [파일 3] 반별 결시 학생 현황 — 첨부 양식과 같은 열 구성, A4 세로 1장에 맞춤
 function buildAbsenceWorkbook(ctx, targets) {
+  return buildAbsenceWorkbookFrom(absenceAllPages(ctx, targets).map(a => ({ a, name: `${a.g}학년${a.c}반_${a.kind}반` })));
+}
+// 고사실별 양면용: [앞면 고정반, 뒷면 이동반(없으면 빈 면)] 순서로 시트를 만든다
+function buildAbsenceRoomWorkbook(pairs) {
+  return buildAbsenceWorkbookFrom(pairs.flatMap(r => [
+    { a: r.front, name: `${r.room}고사실_앞(${r.room}고정)` },
+    r.back ? { a: r.back, name: `${r.room}고사실_뒤(${r.back.g}-${r.back.c}이동)` } : { blank: true, name: `${r.room}고사실_뒤(빈 면)` },
+  ]));
+}
+function buildAbsenceWorkbookFrom(items) {
   const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템'; wb.created = new Date();
   const B = XL.border, center = { vertical: 'middle', horizontal: 'center', wrapText: true };
-  absenceAllPages(ctx, targets).forEach(a => {
-    const ws = wb.addWorksheet(`${a.g}학년${a.c}반_${a.kind}반`, { pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 1, horizontalCentered: true, margins: { left: .4, right: .4, top: .39, bottom: .39, header: 0, footer: 0 } } });
+  items.forEach(({ a, name, blank }) => {
+    if (blank) {
+      const ws = wb.addWorksheet(name.slice(0, 31), { pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 1 } });
+      ws.getColumn(2).width = 60; ws.getCell('B2').value = '(이 고사실로 오는 이동반 없음 — 빈 면)'; ws.getCell('B2').font = XL.font(11, false, 'FF94A3B8');
+      return;
+    }
+    const ws = wb.addWorksheet(name.slice(0, 31), { pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 1, horizontalCentered: true, margins: { left: .4, right: .4, top: .39, bottom: .39, header: 0, footer: 0 } } });
     [1.9, 17, 8.1, 29.6, 18.6, 45, 11, 10.2, 17.1, 2.6].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
     const put = (addr, v, font, align = center, border = true) => { const x = ws.getCell(addr); x.value = v; x.font = font; x.alignment = align; if (border) x.border = B; return x; };
     ws.getRow(1).height = 41.25; ws.mergeCells('B1:I1'); put('B1', a.title, XL.font(19, true), center, false);
@@ -1284,10 +1317,11 @@ function App() {
     if (!GRADES.some(g => selected[g].length && exams[g].some(e => !e.self))) { alert('선택한 학년의 시험 시간표에 시험 과목이 없습니다. 시간표를 업로드하거나 [시간표 확인·수정] 탭에서 입력하세요.'); return false; }
     return true;
   };
-  const exportFile = async (kind, targets) => {
+  const exportFile = async (kind, targets, pairs) => {
     if (targets ? !students.length : !guard()) return;
-    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : kind === 3 ? '반별 결시 학생 현황 엑셀 생성 중...' : kind === 4 ? '고사실 통계 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
+    setBusy(true); say(kind === 1 ? '과목별 응시현황 엑셀 생성 중...' : kind === 3 ? '반별 결시 학생 현황 엑셀 생성 중...' : kind === 4 ? '고사실 통계 엑셀 생성 중...' : kind === 5 ? '고사실별 결시 현황 엑셀 생성 중...' : '칠판 부착용 B4 출력물 생성 중...', 'info');
     try {
+      if (kind === 5) { await downloadWorkbook(buildAbsenceRoomWorkbook(pairs), `정기고사_결시현황_고사실별_양면_A4.xlsx`); say(`✅ 고사실별 결시 학생 현황(양면용, ${pairs.length}개 고사실) 다운로드 완료! 엑셀에서 '양면 인쇄 · 짧은 쪽 넘김'으로 전체 인쇄하세요.`); return; }
       if (kind === 4) { await downloadWorkbook(buildStatsWorkbook(statsData(sx)), `정기고사_고사실별_응시인원_통계_B4.xlsx`); say('✅ [파일 4] 고사실 통계(B4) 다운로드 완료!'); return; }
       if (kind === 3) { const tg = targets || GRADES.flatMap(g => selected[g].map(c => [g, c])); await downloadWorkbook(buildAbsenceWorkbook(ctx, tg), tg.length === 1 ? `정기고사_결시현황_${tg[0][0]}학년${tg[0][1]}반_A4.xlsx` : `정기고사_반별_결시학생현황_A4.xlsx`); say('✅ [파일 3] 반별 결시 학생 현황(A4) 다운로드 완료!'); return; }
       if (kind === 1) { await downloadWorkbook(buildOverviewWorkbook(ctx), `정기고사_선택과목_응시현황_및_확인표.xlsx`); say('✅ [파일 1] 과목별 응시현황 및 응시확인표 다운로드 완료!'); }
@@ -1448,7 +1482,7 @@ function App() {
           ${tab === 'stats' && !VIEWER && statsD && html`<${StatsTab} sx=${sx} D=${statsD} classesByGrade=${classesByGrade} busy=${busy} onExport=${() => exportFile(4)}
               setThr=${(k, v) => setThrState(x => ({ ...x, [k]: v }))} setTimes=${(pp, v) => setTimesState(x => ({ ...x, [pp]: v }))}
               setEditor=${(k, v) => setEditors(x => ({ ...x, [k]: v }))} setRoom=${(hk, v) => setRoomOv(x => ({ ...x, [hk]: v }))} resetRooms=${() => setRoomOv({})} />`}
-          ${tab === 'absence' && !VIEWER && html`<${AbsencePreview} ab=${ab} setAb=${setAb} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} onExport=${t => exportFile(3, t)} busy=${busy} />`}
+          ${tab === 'absence' && !VIEWER && html`<${AbsencePreview} ab=${ab} setAb=${setAb} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} roomMap=${roomMap} onExport=${t => exportFile(3, t)} onExportRooms=${pairs => exportFile(5, null, pairs)} busy=${busy} />`}
         </div>
       </div>
     </main>
@@ -1708,7 +1742,7 @@ function StatsTab({ sx, D, setThr, setTimes, setEditor, setRoom, resetRooms, cla
 }
 
 /* --------------------------- 반별 결시 학생 현황 미리보기 --------------------------- */
-function AbsencePreview({ ab, setAb, ctx, classesByGrade, presentGrades, onExport, busy }) {
+function AbsencePreview({ ab, setAb, ctx, classesByGrade, presentGrades, onExport, onExportRooms, roomMap, busy }) {
   const { selected } = ctx;
   const g = presentGrades.includes(ab.g) ? ab.g : presentGrades[0];
   if (!g) return html`<p className="text-sm text-slate-400">명단을 먼저 업로드하세요.</p>`;
@@ -1728,6 +1762,27 @@ function AbsencePreview({ ab, setAb, ctx, classesByGrade, presentGrades, onExpor
       <button data-xl="abclass" onClick=${() => onExport([[g, c]])} disabled=${busy} className=${`${pbtn} bg-rose-600 text-white ml-auto`}>⬇ ${g}학년 ${c}반 엑셀</button>
       <button data-xl="aball" onClick=${() => onExport()} disabled=${busy} className=${`${pbtn} bg-rose-700 text-white`}>⬇ 선택 학급 엑셀</button>
     </div>
+    ${(() => {
+      const one = absenceRoomPairs(ctx, roomMap, [[g, c]])[0];
+      const allPairs = absenceRoomPairs(ctx, roomMap, selTargets);
+      const flip = !!ab.flip;
+      return html`<div className="rounded-xl border border-indigo-200 bg-indigo-50/60 p-3.5 mb-3" id="roomDuplex">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
+          <span className="text-sm font-bold text-indigo-900">🏫 고사실별 양면 인쇄</span>
+          <span className="text-xs text-indigo-800">A4 양면 1장 · 상철 — 앞면 <b>고정반</b>, 뒷면 그 교실로 <b>이동해 오는 반</b></span>
+        </div>
+        <div className="text-xs text-slate-700 mb-2.5" id="roomPairInfo">${one
+          ? html`<b>${one.room} 고사실</b>: 앞면 ${one.room} 고정반(${one.front.df.length}명) / 뒷면 ${one.back ? `${one.back.g}-${one.back.c} 이동반(${one.back.df.length}명)` : '이동반 없음(빈 면)'}`
+          : '이 반은 고사실 정보가 없습니다.'} <span className="text-slate-400">· 짝은 [고사실 통계 → 고사실 구성] 설정을 따릅니다.</span></div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button data-print="room" disabled=${!one} onClick=${() => printPages(absenceRoomPrintPages([one], flip), 'a4')} className=${`${pbtn} bg-indigo-700 text-white`}>🖨 ${g}-${c} 고사실 양면 인쇄 (2쪽)</button>
+          <button data-print="roomall" disabled=${!allPairs.length} onClick=${() => printPages(absenceRoomPrintPages(allPairs, flip), 'a4')} className=${`${pbtn} bg-indigo-600 text-white`}>🖨 선택 학급 고사실 모두 (${allPairs.length}장 · ${allPairs.length * 2}쪽)</button>
+          <button data-xl="roomall" disabled=${busy || !allPairs.length} onClick=${() => onExportRooms(allPairs)} className=${`${pbtn} bg-white text-indigo-700 border border-indigo-300`}>⬇ 고사실 순 엑셀</button>
+          <label className="flex items-center gap-1.5 text-[11px] text-slate-600 ml-auto"><input type="checkbox" data-flip checked=${flip} onChange=${e => setAb(x => ({ ...x, flip: e.target.checked }))} /> 프린터가 '긴 쪽 넘김'만 될 때 (뒷면 거꾸로 인쇄)</label>
+        </div>
+        <p className="text-[11px] text-slate-500 mt-2">인쇄 창에서 <b>양면 인쇄 → 짧은 쪽으로 넘기기</b>를 고르세요. 웹 페이지는 프린터의 양면 설정을 대신 바꿀 수 없습니다. 짧은 쪽 넘김이 없는 프린터는 위 체크를 켜고 긴 쪽 넘김으로 인쇄하면 상철이 됩니다. 이동반이 없는 고사실은 뒷면이 빈 면으로 들어가 앞뒤 짝이 어긋나지 않습니다.</p>
+      </div>`;
+    })()}
     ${a.df.length ? html`<${ScaledPage} htmlStr=${`<div style="padding:10mm;background:#fff;height:297mm;box-sizing:border-box">${absenceHTML(a)}</div>`} widthPx=${210 * MM} heightPx=${297 * MM} zoom="fit" />`
       : html`<p className="p-10 text-center text-slate-500 bg-slate-50 rounded-lg">${g}학년 ${c}반 ${ab.kind}반 학생이 없습니다.</p>`}
     <p className="mt-2 text-[11px] text-slate-500">반별 이동반·고정반마다 A4 세로 1장입니다. 응시인원 칸 아래 빈 공간에 감독 교사가 결시자 번호·이름·사유를 적습니다.</p>
