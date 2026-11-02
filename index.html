@@ -1104,12 +1104,12 @@ function App() {
   const [cfgOpen, setCfgOpen] = useState(false);
   // 화면 상태
   const [tab, setTab] = useState(VIEWER ? 'chalkboard' : 'timetable');
-  const [selGrade, setSelGrade] = useState(3);
-  const [ttGrade, setTTGrade] = useState(3);
-  const [pv, setPv] = useState({ g: 3, c: 1, kind: '고정', day: 1, zoom: 'fit' });
-  const [ov, setOv] = useState({ g: 3, c: 'all' });
-  const [cf, setCf] = useState({ g: 3, c: 1 });
-  const [ab, setAb] = useState({ g: 3, c: 1, kind: '이동' });
+  const [selGrade, setSelGrade] = useState(1);
+  const [ttGrade, setTTGrade] = useState(1);
+  const [pv, setPv] = useState({ g: 1, c: 1, kind: '고정', day: 1, zoom: 'fit' });
+  const [ov, setOv] = useState({ g: 1, c: 'all' });
+  const [cf, setCf] = useState({ g: 1, c: 1 });
+  const [ab, setAb] = useState({ g: 1, c: 1, kind: '이동' });
   const [exam, setExam] = useState(defaultExam);
   // 고사실 통계용 (관리자)
   const [types, setTypes] = useState({ 1: {}, 2: {}, 3: {} }); // 과목별 통/선
@@ -1130,8 +1130,8 @@ function App() {
     const keys = [...new Set(r.students.map(s => clsKey(s.g, s.c)))];
     setSel(prev => { const base = keepSel || prev; const next = {}; keys.forEach(k => { next[k] = base[k] !== undefined ? base[k] : true; }); return next; });
     const gs = [...new Set(r.students.map(s => s.g))].sort();
-    if (!gs.includes(selGrade)) setSelGrade(gs[gs.length - 1]);
-    if (!gs.includes(pv.g)) setPv(p => ({ ...p, g: gs[gs.length - 1], c: Math.min(...r.students.filter(s => s.g === gs[gs.length - 1]).map(s => s.c)) }));
+    if (!gs.includes(selGrade)) setSelGrade(gs[0]);
+    if (!gs.includes(pv.g)) setPv(p => ({ ...p, g: gs[0], c: Math.min(...r.students.filter(s => s.g === gs[0]).map(s => s.c)) }));
     const ex = r.students.filter(s => s.excluded).length;
     say(`✓ 명단 로드 완료: ${gs.map(g => `${g}학년 ${r.students.filter(s => s.g === g && !s.excluded).length}명`).join(' · ')}${ex ? ` (전출·위탁 등 ${ex}명 자동 제외)` : ''}${r.unknownGrade ? ` · 학년을 알 수 없는 ${r.unknownGrade}명 제외` : ''}`);
     return r;
