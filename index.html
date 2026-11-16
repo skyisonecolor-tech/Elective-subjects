@@ -2190,7 +2190,7 @@ function App() {
       <div className="max-w-[1500px] mx-auto px-4 py-5 flex flex-col lg:flex-row justify-between items-center gap-4">
         <h1 className="text-xl sm:text-2xl xl:text-[28px] font-black tracking-tight leading-snug text-center lg:text-left" style=${{ wordBreak: 'keep-all' }}>
           고등학교 정기시험 선택과목 분반 및 <span className="inline-block">시험 시간표 자동 편성 시스템</span></h1>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center justify-center lg:justify-end gap-2">
           ${VIEWER ? html`<span className="text-xs font-semibold px-3 py-1.5 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/40">일반 사용자용 · 자료 기준 ${VIEWER.createdAt}</span>` : html`
           <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-amber-400/20 text-amber-200 border border-amber-300/40">관리자</span>
           <button id="syncBtn" onClick=${() => setSyncOpen(true)} title="여러 관리자가 작업 상태를 자동으로 공유" className=${`text-sm px-3.5 py-2.5 rounded-lg border font-semibold ${{ ok: 'bg-emerald-600/20 border-emerald-400/50 text-emerald-100', dirty: 'bg-amber-500/20 border-amber-300/50 text-amber-100', saving: 'bg-amber-500/20 border-amber-300/50 text-amber-100', connecting: 'bg-slate-800 border-slate-600 text-slate-200', remote: 'bg-sky-500/25 border-sky-300/60 text-sky-100', conflict: 'bg-rose-500/25 border-rose-300/60 text-rose-100', error: 'bg-rose-500/25 border-rose-300/60 text-rose-100', needpw: 'bg-sky-500/25 border-sky-300/60 text-sky-100' }[sync.status] || 'bg-slate-800 border-slate-700 text-slate-200'}`}>
@@ -2226,7 +2226,7 @@ function App() {
         </span>
       </div>
     </div>`}
-    <main className="max-w-[1500px] mx-auto w-full p-4 md:p-6 grid grid-cols-1 xl:grid-cols-12 gap-6 flex-grow">
+    <main className=${`${tab === 'supervise' ? 'max-w-[2200px]' : 'max-w-[1500px]'} mx-auto w-full p-3 md:p-6 grid grid-cols-1 xl:grid-cols-12 gap-6 flex-grow`}>
       ${!VIEWER && tab !== 'supervise' && html`
       <div className="xl:col-span-4 space-y-4">
         ${/* STEP 1 */''}
@@ -2617,6 +2617,7 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   const [view, setView] = useState(sup.teachers.length ? 'grid' : 'list');
   const [dayI, setDayI] = useState(0);
   const [pick, setPick] = useState(null);
+  const [gridDay, setGridDay] = useState('all');
   const [q, setQ] = useState('');
   const [newName, setNewName] = useState('');
   const dragRef = useRef(null);
@@ -2735,17 +2736,17 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
       ${homeDup.length > 0 && html`<span className="text-rose-600 font-semibold">⚠ 담임 학급 중복: ${homeDup.join(', ')}</span>`}
       <span className="ml-auto flex gap-1"><input id="supNewName" value=${newName} onInput=${e => setNewName(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') addTeacher(); }} placeholder="이름" className="border border-slate-300 rounded-md px-2 py-1 w-24" /><button id="supAddT" onClick=${addTeacher} className="px-2.5 py-1 rounded-md border border-slate-300 hover:bg-slate-50 font-semibold">+ 교사 추가</button></span>
     </div>
-    <div className="overflow-x-auto border border-slate-200 rounded-lg">
-    <table className="w-full text-xs border-collapse" id="supTeachers">
+    <div className="overflow-x-auto border border-slate-200 rounded-lg text-xs">
+    <table className="w-full border-collapse" id="supTeachers">
       <thead className="bg-slate-50 text-slate-600 sticky top-0"><tr>
-        <th className="p-1.5 border-b border-slate-200 w-8">#</th><th className="border-b border-slate-200 text-left">교사 (시수)</th><th className="border-b border-slate-200 text-left">담당 (시간표)</th>
+        <th className="p-1.5 border-b border-slate-200 w-8">#</th><th className="border-b border-slate-200 text-left">교사 (시수)</th><th className="border-b border-slate-200 text-left hidden xl:table-cell">담당 (시간표)</th>
         <th className="border-b border-slate-200 text-left" title="이 과목 시험 시간에는 교실 감독 대신 복도 감독(고사본부 앞 우선)">같은 과목 시험 → 복도</th>
         <th className="border-b border-slate-200">담임</th><th className="border-b border-slate-200" title="이번 시험 전까지의 감독 횟수(누계)">이전 감독</th><th className="border-b border-slate-200">모고 지원</th>
         <th className="border-b border-slate-200 text-left">감독 제외 (관리·개인 사유)</th><th className="border-b border-slate-200" title="특이사항(개인 사유 등)으로 교실 정감독을 맡지 않는 교사">감독 제한</th><th className="border-b border-slate-200 w-6"></th></tr></thead>
       <tbody>${shown.map(t => { const ex = t.ex || {}; const subs = [...(m.subsOf[t.name] || [])]; return html`<tr key=${t.name} data-t=${t.name} className=${`border-t border-slate-100 align-top ${ex.mode === 'all' ? 'bg-orange-50/60' : ''}`}>
         <td className="p-1.5 text-center text-slate-400">${m.teachers.indexOf(t) + 1}</td>
         <td className="p-1.5 whitespace-nowrap"><b>${t.name}</b> <span className="text-slate-400">(${t.hours || 0})</span></td>
-        <td className="p-1.5 text-[10px] text-slate-500 max-w-[170px]">${m.teachSum[t.name] || '-'}</td>
+        <td className="p-1.5 text-[10px] text-slate-500 max-w-[170px] hidden xl:table-cell">${m.teachSum[t.name] || '-'}</td>
         <td className="p-1.5"><div className="flex flex-wrap gap-1 max-w-[230px]">
           ${subs.map(k => html`<span key=${k} className=${`inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] ${m.autoSubs[t.name].has(k) ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-violet-50 text-violet-800 border border-violet-200'}`} title=${m.autoSubs[t.name].has(k) ? '시간표에서 자동으로 찾음' : '직접 추가'}>${labelOfKey(k)}<button onClick=${() => toggleSub(t.name, k, false)} className="text-slate-400 hover:text-rose-600">×</button></span>`)}
           <select data-subadd=${t.name} value="" onChange=${e => { if (e.target.value) toggleSub(t.name, e.target.value, true); }} className="border border-dashed border-slate-300 rounded px-1 py-0.5 text-[10px] text-slate-500 bg-white w-16"><option value="">+ 과목</option>${examOpts.filter(o => !subs.includes(o.k)).map(o => html`<option key=${o.k} value=${o.k}>${o.label}</option>`)}</select></div></td>
@@ -2800,38 +2801,44 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   </div>`;
 
   /* ---- 교사(전체) 편성표: 끌어서 놓거나 두 칸을 차례로 눌러 1:1로 맞바꿈 ---- */
-  const S = m.slots;
+  const gd = gridDay === 'all' || !m.days[gridDay] ? null : m.days[gridDay];
+  const S = gd ? gd.slots : m.slots, D = gd ? [gd] : m.days;
+  const CNT = [['교실', 'room', 1], ['복도', 'cor', 1], ['수업', 'cls', 1], ['대기', 'stb', 1], ['합계', 'sum', 0], ['모고', 'mock', 1], ['이전', 'prev', 1], ['총계', 'total', 0]];
+  const cntCls = d => (d ? 'hidden xl:table-cell' : '');
+  const minW = 88 + S.length * 52 + 2 * 34;
   const dl = i => (i > 0 && S[i - 1].d !== S[i].d ? 'border-l-2 border-l-slate-800' : '');
   const gridView = html`<div>
     <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
       <input value=${q} onInput=${e => setQ(e.target.value)} placeholder="🔍 이름 찾기" className="border border-slate-300 rounded-md px-2 py-1 w-32" />
-      <span className="text-slate-500">칸을 <b>끌어서 같은 열의 다른 교사 칸에 놓으면</b> 두 사람의 자리가 맞바뀝니다. (또는 두 칸을 차례로 클릭) 규칙에 어긋나면 바뀌지 않고 이유를 알려 줍니다. 맨 아래 <b>미배정</b> 줄로 끌면 자리를 비웁니다.</span>
+      <span className="text-slate-500 basis-full lg:basis-auto">칸을 <b>끌어서 같은 열의 다른 교사 칸에 놓으면</b> 두 사람의 자리가 맞바뀝니다. (또는 두 칸을 차례로 클릭) 규칙에 어긋나면 바뀌지 않고 이유를 알려 줍니다. 맨 아래 <b>미배정</b> 줄로 끌면 자리를 비웁니다.</span>
+      <${Seg} value=${gridDay} onChange=${setGridDay} options=${[['all', '전체 일정'], ...m.days.map((d, i) => [i, d.sh])]} size="xs" />
       ${pick && html`<span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-semibold">선택됨: ${pick.t || supText(pick.code)} — 바꿀 칸을 누르세요 <button onClick=${() => setPick(null)} className="underline ml-1">취소</button></span>`}
     </div>
     <div className="flex flex-wrap gap-1.5 mb-2 text-[10px]">${[['R', '교실 1-5(정)/(부)'], ['C', '복도'], ['W', '대기'], ['H', '♣ 출제자(본부)'], ['X', '관리·제외'], ['L', '수업']].map(([k, l]) => html`<span key=${k} className=${`px-1.5 py-0.5 rounded border border-slate-200 ${SUP_KIND_CLS[k]}`}>${l}</span>`)}<span className="px-1.5 py-0.5 rounded border border-slate-200 text-slate-400">동 = 같은 과목 시험(교실 불가)</span><span className="px-1.5 py-0.5 rounded ring-2 ring-inset ring-amber-400">3교시 연속 근무(되도록 피함)</span></div>
-    <div className="overflow-auto border border-slate-300 rounded-lg max-h-[72vh]">
-      <table className="text-[11px] border-collapse" id="supGrid">
+    <div className="overflow-auto border border-slate-300 rounded-lg max-h-[72vh] text-[10.5px] 2xl:text-[11.5px]">
+      <table className="w-full table-fixed border-collapse" style=${{ minWidth: minW }} id="supGrid">
+        <colgroup><col style=${{ width: 88 }} />${S.map(s => html`<col key=${s.key} />`)}${CNT.map(([t, , d]) => html`<col key=${t} className=${cntCls(d)} style=${{ width: 34 }} />`)}</colgroup>
         <thead className="sticky top-0 z-10">
           <tr className="bg-slate-100"><th rowSpan="2" className="sticky left-0 z-20 bg-slate-100 border border-slate-300 px-2">교사</th>
-            ${m.days.map(d => html`<th key=${d.d} colSpan=${d.slots.length} className="border border-slate-300 px-1 py-1 bg-sky-50">${d.sh}</th>`)}
-            ${['교실', '복도', '수업', '대기', '합계', '모고', '이전', '총계'].map(t => html`<th key=${t} rowSpan="2" className=${`border border-slate-300 px-1.5 ${t === '총계' ? 'bg-amber-100' : t === '합계' ? 'bg-sky-100' : ''}`}>${t}</th>`)}</tr>
-          <tr className="bg-violet-100">${S.map((s, i) => html`<th key=${s.key} className=${`border border-slate-300 px-1 py-0.5 font-semibold ${dl(i)}`} title=${GRADES.map(g => `${g}학년 ${s.subs[g].join('/') || '-'}`).join('\n')}>${s.p}교시<div className="text-[9px] font-normal text-slate-500 max-w-[70px] truncate">${GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join('·')}</div></th>`)}</tr>
+            ${D.map(d => html`<th key=${d.d} colSpan=${d.slots.length} className="border border-slate-300 px-1 py-1 bg-sky-50">${d.sh}</th>`)}
+            ${CNT.map(([t, , d]) => html`<th key=${t} rowSpan="2" className=${`border border-slate-300 px-0 text-[10px] ${cntCls(d)} ${t === '총계' ? 'bg-amber-100' : t === '합계' ? 'bg-sky-100' : ''}`}>${t}</th>`)}</tr>
+          <tr className="bg-violet-100">${S.map((s, i) => html`<th key=${s.key} className=${`border border-slate-300 px-0.5 py-0.5 font-semibold ${dl(i)}`} title=${GRADES.map(g => `${g}학년 ${s.subs[g].join('/') || '-'}`).join('\n')}>${s.p}교시<div className="text-[9px] font-normal text-slate-500 truncate">${GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join('·')}</div></th>`)}</tr>
         </thead>
         <tbody>
           ${shown.map(t => { const c = counts[t.name]; return html`<tr key=${t.name}>
-            <td className="sticky left-0 z-[5] bg-white border border-slate-300 px-2 py-0.5 whitespace-nowrap font-semibold">${t.name}${t.home && html`<span className="ml-1 text-[9px] text-slate-400 font-normal">${t.home}담임</span>`}${t.only && html`<span className="ml-1 text-[9px] text-violet-600 font-normal">${SUP_ONLY[t.only]}</span>`}</td>
+            <td className="sticky left-0 z-[5] bg-white border border-slate-300 px-1.5 py-0.5 font-semibold leading-tight truncate" title=${[t.home && `${t.home} 담임`, t.only && SUP_ONLY[t.only]].filter(Boolean).join(' · ')}>${t.name}${(t.home || t.only) && html`<div className="text-[9px] font-normal truncate">${t.home && html`<span className="text-slate-400">${t.home}담임 </span>`}${t.only && html`<span className="text-violet-600">${SUP_ONLY[t.only]}</span>`}</div>`}</td>
             ${S.map((s, i) => { const x = supCell(m, s, t.name), err = chk.cellErr[s.key] && chk.cellErr[s.key][t.name], w3 = chk.cellWarn[s.key] && chk.cellWarn[s.key][t.name];
               const tgt = { k: s.key, t: t.name }, can = !x.fixed && !!x.code;
               return html`<td key=${s.key} data-cell=${`${s.key}|${t.name}`} title=${err || [x.title, w3].filter(Boolean).join(' · ') || (x.same ? `같은 과목 시험: ${x.same.join(', ')} → 교실 감독 불가` : '')}
                 ...${can ? drag(tgt) : {}} ...${dnd(tgt)} onClick=${() => !x.fixed && clickCell(tgt)}
-                className=${`border border-slate-300 px-1 py-0.5 text-center whitespace-nowrap min-w-[58px] ${SUP_KIND_CLS[x.kind] || ''} ${dl(i)} ${can ? 'cursor-grab' : x.fixed ? 'cursor-not-allowed' : 'cursor-pointer'} ${err ? 'ring-2 ring-inset ring-rose-500 !bg-rose-50' : w3 ? 'ring-2 ring-inset ring-amber-400' : ''} ${isPick(s.key, t.name) ? 'ring-2 ring-inset ring-indigo-600 !bg-indigo-50' : ''}`}>${x.kind === 'H' ? x.short : x.text}${!x.code && !x.fixed && x.same ? html`<span className="text-[9px] text-slate-400">동</span>` : ''}</td>`; })}
-            <td className="border border-slate-300 text-center">${c.room}</td><td className="border border-slate-300 text-center">${c.cor || ''}</td><td className="border border-slate-300 text-center text-slate-500" data-cls-count=${t.name}>${c.cls || ''}</td><td className="border border-slate-300 text-center text-red-600">${c.stb || ''}</td>
-            <td className="border border-slate-300 text-center font-semibold bg-sky-50" data-sum=${t.name}>${c.sum}</td><td className="border border-slate-300 text-center">${c.mock || ''}</td><td className="border border-slate-300 text-center">${c.prev || ''}</td><td className="border border-slate-300 text-center font-bold bg-amber-50" data-total=${t.name}>${c.total}</td>
+                className=${`border border-slate-300 px-0.5 py-0.5 text-center whitespace-nowrap overflow-hidden text-ellipsis ${SUP_KIND_CLS[x.kind] || ''} ${dl(i)} ${can ? 'cursor-grab' : x.fixed ? 'cursor-not-allowed' : 'cursor-pointer'} ${err ? 'ring-2 ring-inset ring-rose-500 !bg-rose-50' : w3 ? 'ring-2 ring-inset ring-amber-400' : ''} ${isPick(s.key, t.name) ? 'ring-2 ring-inset ring-indigo-600 !bg-indigo-50' : ''}`}>${x.kind === 'H' ? x.short : x.text}${!x.code && !x.fixed && x.same ? html`<span className="text-[9px] text-slate-400">동</span>` : ''}</td>`; })}
+            ${CNT.map(([lab, k, d]) => html`<td key=${k} className=${`border border-slate-300 text-center ${cntCls(d)} ${k === 'sum' ? 'font-semibold bg-sky-50' : k === 'total' ? 'font-bold bg-amber-50' : k === 'stb' ? 'text-red-600' : k === 'cls' ? 'text-slate-500' : ''}`}
+              ...${k === 'sum' ? { 'data-sum': t.name } : k === 'total' ? { 'data-total': t.name } : k === 'cls' ? { 'data-cls-count': t.name } : {}}>${k === 'sum' || k === 'total' || k === 'room' ? c[k] : c[k] || ''}</td>`)}
           </tr>`; })}
           <tr className="bg-amber-50"><td className="sticky left-0 z-[5] bg-amber-100 border border-slate-300 px-2 font-bold text-amber-900">미배정</td>
             ${S.map((s, i) => html`<td key=${s.key} ...${dnd({ k: s.key, zone: true })} onClick=${e => { if (e.target === e.currentTarget && pick && pick.t) clickCell({ k: s.key, zone: true }); }} data-unfilled=${s.key} className=${`border border-slate-300 p-0.5 align-top ${dl(i)}`}><div className="flex flex-col gap-0.5">
-              ${(chk.unfilled[s.key] || []).map(code => html`<span key=${code} ...${drag({ k: s.key, code })} onClick=${() => clickCell({ k: s.key, code })} data-chip=${`${s.key}|${code}`} className=${`px-1 rounded border text-[10px] cursor-grab whitespace-nowrap ${isPick(s.key, undefined, code) ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-amber-300 text-amber-900'}`}>${supText(code)}</span>`)}</div></td>`)}
-            <td colSpan="8" className="border border-slate-300 text-[10px] text-slate-500 px-2">교시별 남은 자리</td></tr>
+              ${(chk.unfilled[s.key] || []).map(code => html`<span key=${code} ...${drag({ k: s.key, code })} onClick=${() => clickCell({ k: s.key, code })} data-chip=${`${s.key}|${code}`} className=${`px-0.5 rounded border text-[10px] cursor-grab truncate ${isPick(s.key, undefined, code) ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-amber-300 text-amber-900'}`}>${supText(code)}</span>`)}</div></td>`)}
+            ${CNT.map(([t, , d]) => html`<td key=${t} className=${`border border-slate-300 ${cntCls(d)}`}></td>`)}</tr>
         </tbody>
       </table>
     </div>
