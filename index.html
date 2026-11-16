@@ -981,7 +981,9 @@ const DEFAULT_SUP_NOTE = [
   '● 대기감독 - 시험 시작 5분 전부터 교무실에서 대기',
 ].join('\n');
 const defaultSup = () => ({ teachers: [], ttLabel: '', wd: {}, cls: {}, pmap: { 1: [1], 2: [2], 3: [3], 4: [4] }, posts: DEFAULT_POSTS.map(p => ({ ...p })), standby: 3, prevK: 2, note: DEFAULT_SUP_NOTE, assign: {}, genAt: '' });
-const newTeacher = (name, hours = 0, tt = {}) => ({ name, hours, tt, home: '', prev: 0, mock: 0, ex: { mode: '', days: {}, reason: '' }, subAdd: [], subDel: [] });
+// 개인 사유 등으로 맡을 수 있는 감독 종류를 제한 (교실 정감독 불가)
+const SUP_ONLY = { '': '제한 없음', subcor: '2감독·복도만', sub: '2감독(부)만', cor: '복도만' };
+const newTeacher = (name, hours = 0, tt = {}) => ({ name, hours, tt, home: '', only: '', prev: 0, mock: 0, ex: { mode: '', days: {}, reason: '' }, subAdd: [], subDel: [] });
 const splitNames = s => String(s || '').split(/[\/,·;\s]+/).map(x => x.trim()).filter(Boolean);
 const supText = (code, short) => { const [k, a, b] = String(code).split('|'); return k === 'R' ? `${a}(${b})` : k === 'C' ? a : k === 'W' ? `대기${a}` : code; };
 
@@ -1111,7 +1113,7 @@ function supModel(sup, D, sx) {
   });
   const days = []; slots.forEach(s => { const l = days[days.length - 1]; if (l && l.d === s.d) l.slots.push(s); else days.push({ d: s.d, md: s.md, dot: s.dot, sh: s.sh, wd: s.wd, awd: supWdOf({ wd: {} }, tt, s.d), slots: [s] }); });
   const sorted = [...sup.teachers].sort((a, b) => a.name.localeCompare(b.name, 'ko')); // 감독표는 교사명 가나다순
-  return { slots, days, teachers: sorted, autoSubs, subsOf, teachSum, forbid, moveRoomOf, issues, examSubs, sup, present, classes: classesByGrade };
+  return { slots, days, teachers: sorted, autoSubs, subsOf, teachSum, forbid, moveRoomOf, issues, examSubs, sup, present, classes: classesByGrade, tmap: Object.fromEntries(sorted.map(t => [t.name, t])) };
 }
 // 칸 하나에 이 교사가 이 자리를 맡을 수 있는지 (안 되면 이유)
 function supCan(m, s, name, code) {
@@ -1123,6 +1125,12 @@ function supCan(m, s, name, code) {
   const [k, room] = code.split('|');
   if (k === 'R' && o.same) return `${name} 선생님은 같은 과목(${o.same.join(', ')}) 시험 시간이라 교실 감독을 맡을 수 없습니다. 복도 감독만 가능합니다.`;
   if (k === 'R' && m.forbid[name] && m.forbid[name].has(room)) { const t = m.teachers.find(x => x.name === name); return `${name} 선생님은 ${t.home}반 담임이라 ${room} 교실(담임반 또는 담임반 학생이 이동하는 교실)을 감독할 수 없습니다.`; }
+  const lim = ((m.tmap || {})[name] || {}).only || '';
+  if (lim) {
+    const role = code.split('|')[2];
+    const ok = k === 'R' ? role === '부' && lim !== 'cor' : k === 'C' ? lim !== 'sub' : false;
+    if (!ok) return `${name} 선생님은 '${SUP_ONLY[lim]}' 가능(특이사항)이라 ${k === 'W' ? '대기 감독(교실 투입 가능)' : `'${supText(code)}'`}을(를) 맡을 수 없습니다.`;
+  }
   if (k === 'W' && o.same) return `${name} 선생님은 같은 과목 시험 시간이라 대기 감독(교실 투입 가능)을 맡지 않습니다.`;
   return null;
 }
@@ -1174,7 +1182,7 @@ function supCounts(m) {
       if (code[0] === 'R' || code[0] === 'C') c.day[s.d] = (c.day[s.d] || 0) + 1;
     });
   });
-  Object.values(C).forEach(c => { c.now = c.room + c.cor; c.load = c.now + c.cls; c.sum = c.now + c.mock; c.total = c.sum + c.prev; });
+  Object.values(C).forEach(c => { c.now = c.room + c.cor; c.load = c.now + c.cls; c.sum = c.room + c.cor + c.cls + c.stb; c.total = c.sum + c.mock + c.prev; }); // 합계 = 이번 시험(교실+복도+수업+대기), 총계 = 합계+모고+이전
   return C;
 }
 // 자동 편성: 교시 순서대로 채운 뒤, 많이 맡은 교사의 자리를 덜 맡은 교사에게 넘기며 고르게 맞춘다
@@ -1206,13 +1214,13 @@ function supGenerate(m) {
     const byCost = arr => arr.slice().sort((a, b) => cost(a, s) - cost(b, s));
     const posts = s.pos.filter(c => c[0] === 'C').sort((a, b) => (hqPosts.has(b) ? 1 : 0) - (hqPosts.has(a) ? 1 : 0));
     // 1) 같은 과목 교사 → 복도 (고사본부 앞 먼저)
-    byCost(T.filter(n => free(n) && s.info[n].same)).forEach(n => { if (posts.length) put(A, n, posts.shift(), s); });
+    byCost(T.filter(n => free(n) && s.info[n].same && !supCan(m, s, n, posts[0] || 'C|x'))).forEach(n => { if (posts.length) put(A, n, posts.shift(), s); });
     // 2) 교실 감독 (정 → 부)
     s.pos.filter(c => c[0] === 'R').forEach(code => { const n = byCost(T.filter(x => free(x) && !supCan(m, s, x, code)))[0]; if (n) put(A, n, code, s); });
     // 3) 남은 복도
-    posts.forEach(code => { const n = byCost(T.filter(free))[0]; if (n) put(A, n, code, s); });
+    posts.forEach(code => { const n = byCost(T.filter(x => free(x) && !supCan(m, s, x, code)))[0]; if (n) put(A, n, code, s); });
     // 4) 대기 (대기를 적게 맡은 순)
-    s.pos.filter(c => c[0] === 'W').forEach(code => { const n = T.filter(x => free(x) && !s.info[x].same).sort((a, b) => stb[a] - stb[b] || cost(a, s) - cost(b, s))[0]; if (n) put(A, n, code, s); });
+    s.pos.filter(c => c[0] === 'W').forEach(code => { const n = T.filter(x => free(x) && !supCan(m, s, x, code)).sort((a, b) => stb[a] - stb[b] || cost(a, s) - cost(b, s))[0]; if (n) put(A, n, code, s); });
   });
   // 5) 고르게 맞추기
   for (let it = 0; it < 60; it++) {
@@ -1333,9 +1341,9 @@ function supClassHTML(m, day, examTitle) {
 function supTeacherHTML(m, examTitle, counts, chk) {
   const S = m.slots;
   const dl = i => (i > 0 && S[i - 1].d !== S[i].d ? ' style="border-left:2px solid #000"' : '');
-  const head = `<tr><th rowspan="2">교사</th>${m.days.map(d => `<th colspan="${d.slots.length}" style="background:#DCE6F1">${esc(d.sh)}</th>`).join('')}<th rowspan="2">교실</th><th rowspan="2">모고</th><th rowspan="2">복도</th><th rowspan="2">수업</th><th rowspan="2">합계</th><th rowspan="2">이전</th><th rowspan="2" class="tot">총계</th></tr>`
+  const head = `<tr><th rowspan="2">교사</th>${m.days.map(d => `<th colspan="${d.slots.length}" style="background:#DCE6F1">${esc(d.sh)}</th>`).join('')}<th rowspan="2">교실</th><th rowspan="2">복도</th><th rowspan="2">수업</th><th rowspan="2">대기</th><th rowspan="2" style="background:#DDEBF7">합계</th><th rowspan="2">모고</th><th rowspan="2">이전</th><th rowspan="2" class="tot">총계</th></tr>`
     + `<tr>${S.map((s, i) => `<th class="ph"${dl(i)}>${s.p}교시<div class="sub">${esc(GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join(' · '))}</div></th>`).join('')}</tr>`;
-  const body = m.teachers.map(t => { const c = counts[t.name]; return `<tr><td class="nm">${esc(t.name)}</td>${S.map((s, i) => { const x = supCell(m, s, t.name), e = chk && chk.cellErr[s.key] && chk.cellErr[s.key][t.name]; return `<td class="${supCls(x)}${e ? ' err' : ''}"${dl(i)}>${esc(x.short || x.text)}</td>`; }).join('')}<td>${c.room}</td><td>${c.mock || ''}</td><td>${c.cor || ''}</td><td>${c.cls || ''}</td><td>${c.sum}</td><td>${c.prev || ''}</td><td class="tot">${c.total}</td></tr>`; }).join('');
+  const body = m.teachers.map(t => { const c = counts[t.name]; return `<tr><td class="nm">${esc(t.name)}</td>${S.map((s, i) => { const x = supCell(m, s, t.name), e = chk && chk.cellErr[s.key] && chk.cellErr[s.key][t.name]; return `<td class="${supCls(x)}${e ? ' err' : ''}"${dl(i)}>${esc(x.short || x.text)}</td>`; }).join('')}<td>${c.room}</td><td>${c.cor || ''}</td><td>${c.cls || ''}</td><td>${c.stb || ''}</td><td style="background:#EEF5FB;font-weight:700">${c.sum}</td><td>${c.mock || ''}</td><td>${c.prev || ''}</td><td class="tot">${c.total}</td></tr>`; }).join('');
   return `<div class="sup"><div class="ttl">${esc(examTitle)} 감독 편성표 (교사별)</div><table class="full"><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
 }
 function supAllPages(m, examTitle, counts) {
@@ -1441,7 +1449,7 @@ function buildSupWorkbook(m, examTitle, counts) {
   const cell = mk(ws), S = m.slots, nS = S.length, C0 = 2 + nS;
   cell(1, 1, '요일', { bold: true, fill: 'FFE7E6E6' });
   let c = 2; m.days.forEach(d => { if (d.slots.length > 1) ws.mergeCells(1, c, 1, c + d.slots.length - 1); cell(1, c, d.sh, { bold: true, fill: 'FFDCE6F1' }); for (let k = 1; k < d.slots.length; k++) cell(1, c + k, null, { fill: 'FFDCE6F1' }); c += d.slots.length; });
-  ['교실', '모고', '복도', '수업', '합계', '이전', '총계'].forEach((t, k) => { ws.mergeCells(1, C0 + k, 2, C0 + k); cell(1, C0 + k, t, { bold: true, fill: t === '총계' ? 'FFFFF2CC' : 'FFE7E6E6' }); cell(2, C0 + k, null, { fill: t === '총계' ? 'FFFFF2CC' : 'FFE7E6E6' }); });
+  ['교실', '복도', '수업', '대기', '합계', '모고', '이전', '총계'].forEach((t, k) => { ws.mergeCells(1, C0 + k, 2, C0 + k); cell(1, C0 + k, t, { bold: true, fill: t === '총계' ? 'FFFFF2CC' : 'FFE7E6E6' }); cell(2, C0 + k, null, { fill: t === '총계' ? 'FFFFF2CC' : 'FFE7E6E6' }); });
   cell(2, 1, '교사', { bold: true, fill: 'FFE7E6E6' });
   S.forEach((s, j) => cell(2, 2 + j, `${s.p}교시\n(${GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join('/')})`, { size: 7, fill: 'FFC49DD6' }));
   ws.getRow(1).height = 21.75; ws.getRow(2).height = 34;
@@ -1449,10 +1457,10 @@ function buildSupWorkbook(m, examTitle, counts) {
     const r = 3 + i, k = counts[t.name];
     cell(r, 1, t.name, { bold: true });
     S.forEach((s, j) => { const x = supCell(m, s, t.name); codeCell(cell, r, 2 + j, { ...x, text: x.short || x.text }); });
-    [k.room, k.mock || '', k.cor || '', k.cls || '', k.sum, k.prev || '', k.total].forEach((v, q) => cell(r, C0 + q, v, { bold: q === 6, fill: q === 6 ? 'FFFFF2CC' : undefined }));
+    [k.room, k.cor || '', k.cls || '', k.stb || '', k.sum, k.mock || '', k.prev || '', k.total].forEach((v, q) => cell(r, C0 + q, v, { bold: q === 4 || q === 7, fill: q === 7 ? 'FFFFF2CC' : q === 4 ? 'FFDDEBF7' : undefined }));
     ws.getRow(r).height = 21.75;
   });
-  ws.getColumn(1).width = 8.2; S.forEach((_, j) => { ws.getColumn(2 + j).width = 8.4; }); for (let q = 0; q < 7; q++) ws.getColumn(C0 + q).width = 5.2;
+  ws.getColumn(1).width = 8.2; S.forEach((_, j) => { ws.getColumn(2 + j).width = 8.4; }); for (let q = 0; q < 8; q++) ws.getColumn(C0 + q).width = 5.2;
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 2 }];
   return wb;
 }
@@ -2723,7 +2731,7 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   const listView = html`<div>
     <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
       <input value=${q} onInput=${e => setQ(e.target.value)} placeholder="🔍 이름 찾기" className="border border-slate-300 rounded-md px-2 py-1 w-32" />
-      <span className="text-slate-500">전체 기간 제외 ${m.teachers.filter(t => (t.ex || {}).mode === 'all').length}명 · 일부 날짜 제외 ${m.teachers.filter(t => (t.ex || {}).mode === 'days').length}명 · 담임 ${m.teachers.filter(t => t.home).length}명</span>
+      <span className="text-slate-500">전체 기간 제외 ${m.teachers.filter(t => (t.ex || {}).mode === 'all').length}명 · 일부 날짜 제외 ${m.teachers.filter(t => (t.ex || {}).mode === 'days').length}명 · 담임 ${m.teachers.filter(t => t.home).length}명 · 감독 제한 ${m.teachers.filter(t => t.only).length}명</span>
       ${homeDup.length > 0 && html`<span className="text-rose-600 font-semibold">⚠ 담임 학급 중복: ${homeDup.join(', ')}</span>`}
       <span className="ml-auto flex gap-1"><input id="supNewName" value=${newName} onInput=${e => setNewName(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') addTeacher(); }} placeholder="이름" className="border border-slate-300 rounded-md px-2 py-1 w-24" /><button id="supAddT" onClick=${addTeacher} className="px-2.5 py-1 rounded-md border border-slate-300 hover:bg-slate-50 font-semibold">+ 교사 추가</button></span>
     </div>
@@ -2733,7 +2741,7 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
         <th className="p-1.5 border-b border-slate-200 w-8">#</th><th className="border-b border-slate-200 text-left">교사 (시수)</th><th className="border-b border-slate-200 text-left">담당 (시간표)</th>
         <th className="border-b border-slate-200 text-left" title="이 과목 시험 시간에는 교실 감독 대신 복도 감독(고사본부 앞 우선)">같은 과목 시험 → 복도</th>
         <th className="border-b border-slate-200">담임</th><th className="border-b border-slate-200" title="이번 시험 전까지의 감독 횟수(누계)">이전 감독</th><th className="border-b border-slate-200">모고 지원</th>
-        <th className="border-b border-slate-200 text-left">감독 제외 (관리·개인 사유)</th><th className="border-b border-slate-200 w-6"></th></tr></thead>
+        <th className="border-b border-slate-200 text-left">감독 제외 (관리·개인 사유)</th><th className="border-b border-slate-200" title="특이사항(개인 사유 등)으로 교실 정감독을 맡지 않는 교사">감독 제한</th><th className="border-b border-slate-200 w-6"></th></tr></thead>
       <tbody>${shown.map(t => { const ex = t.ex || {}; const subs = [...(m.subsOf[t.name] || [])]; return html`<tr key=${t.name} data-t=${t.name} className=${`border-t border-slate-100 align-top ${ex.mode === 'all' ? 'bg-orange-50/60' : ''}`}>
         <td className="p-1.5 text-center text-slate-400">${m.teachers.indexOf(t) + 1}</td>
         <td className="p-1.5 whitespace-nowrap"><b>${t.name}</b> <span className="text-slate-400">(${t.hours || 0})</span></td>
@@ -2749,6 +2757,7 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
           ${ex.mode === 'days' && m.days.map(d => html`<label key=${d.d} className="inline-flex items-center gap-0.5 text-[10px]"><input type="checkbox" data-exday=${`${t.name}|${d.d}`} checked=${!!(ex.days || {})[d.d]} onChange=${e => updT(t.name, x => { x.ex.days = { ...(x.ex.days || {}), [d.d]: e.target.checked }; })} />${d.sh}</label>`)}
           ${ex.mode && html`<input data-reason=${t.name} value=${ex.reason || ''} onInput=${e => updT(t.name, x => { x.ex.reason = e.target.value; })} placeholder="사유 (예: 관리(총괄), 출장)" className="border border-slate-300 rounded px-1.5 py-0.5 w-32" />`}
         </div></td>
+        <td className="p-1.5 text-center"><select data-only=${t.name} value=${t.only || ''} onChange=${e => updT(t.name, x => { x.only = e.target.value; })} className=${`border rounded px-1 py-0.5 ${t.only ? 'border-violet-400 bg-violet-50 text-violet-800 font-semibold' : 'border-slate-300'}`}>${Object.entries(SUP_ONLY).map(([v, l]) => html`<option key=${v} value=${v}>${l}</option>`)}</select></td>
         <td className="p-1.5 text-center"><button title="명단에서 빼기" onClick=${() => removeTeacher(t.name)} className="text-slate-300 hover:text-rose-600 font-bold">×</button></td>
       </tr>`; })}</tbody>
     </table></div>
@@ -2805,24 +2814,24 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
         <thead className="sticky top-0 z-10">
           <tr className="bg-slate-100"><th rowSpan="2" className="sticky left-0 z-20 bg-slate-100 border border-slate-300 px-2">교사</th>
             ${m.days.map(d => html`<th key=${d.d} colSpan=${d.slots.length} className="border border-slate-300 px-1 py-1 bg-sky-50">${d.sh}</th>`)}
-            ${['교실', '복도', '수업', '대기', '모고', '이전', '총계'].map(t => html`<th key=${t} rowSpan="2" className=${`border border-slate-300 px-1.5 ${t === '총계' ? 'bg-amber-100' : ''}`}>${t}</th>`)}</tr>
+            ${['교실', '복도', '수업', '대기', '합계', '모고', '이전', '총계'].map(t => html`<th key=${t} rowSpan="2" className=${`border border-slate-300 px-1.5 ${t === '총계' ? 'bg-amber-100' : t === '합계' ? 'bg-sky-100' : ''}`}>${t}</th>`)}</tr>
           <tr className="bg-violet-100">${S.map((s, i) => html`<th key=${s.key} className=${`border border-slate-300 px-1 py-0.5 font-semibold ${dl(i)}`} title=${GRADES.map(g => `${g}학년 ${s.subs[g].join('/') || '-'}`).join('\n')}>${s.p}교시<div className="text-[9px] font-normal text-slate-500 max-w-[70px] truncate">${GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join('·')}</div></th>`)}</tr>
         </thead>
         <tbody>
           ${shown.map(t => { const c = counts[t.name]; return html`<tr key=${t.name}>
-            <td className="sticky left-0 z-[5] bg-white border border-slate-300 px-2 py-0.5 whitespace-nowrap font-semibold">${t.name}${t.home && html`<span className="ml-1 text-[9px] text-slate-400 font-normal">${t.home}담임</span>`}</td>
+            <td className="sticky left-0 z-[5] bg-white border border-slate-300 px-2 py-0.5 whitespace-nowrap font-semibold">${t.name}${t.home && html`<span className="ml-1 text-[9px] text-slate-400 font-normal">${t.home}담임</span>`}${t.only && html`<span className="ml-1 text-[9px] text-violet-600 font-normal">${SUP_ONLY[t.only]}</span>`}</td>
             ${S.map((s, i) => { const x = supCell(m, s, t.name), err = chk.cellErr[s.key] && chk.cellErr[s.key][t.name], w3 = chk.cellWarn[s.key] && chk.cellWarn[s.key][t.name];
               const tgt = { k: s.key, t: t.name }, can = !x.fixed && !!x.code;
               return html`<td key=${s.key} data-cell=${`${s.key}|${t.name}`} title=${err || [x.title, w3].filter(Boolean).join(' · ') || (x.same ? `같은 과목 시험: ${x.same.join(', ')} → 교실 감독 불가` : '')}
                 ...${can ? drag(tgt) : {}} ...${dnd(tgt)} onClick=${() => !x.fixed && clickCell(tgt)}
                 className=${`border border-slate-300 px-1 py-0.5 text-center whitespace-nowrap min-w-[58px] ${SUP_KIND_CLS[x.kind] || ''} ${dl(i)} ${can ? 'cursor-grab' : x.fixed ? 'cursor-not-allowed' : 'cursor-pointer'} ${err ? 'ring-2 ring-inset ring-rose-500 !bg-rose-50' : w3 ? 'ring-2 ring-inset ring-amber-400' : ''} ${isPick(s.key, t.name) ? 'ring-2 ring-inset ring-indigo-600 !bg-indigo-50' : ''}`}>${x.kind === 'H' ? x.short : x.text}${!x.code && !x.fixed && x.same ? html`<span className="text-[9px] text-slate-400">동</span>` : ''}</td>`; })}
             <td className="border border-slate-300 text-center">${c.room}</td><td className="border border-slate-300 text-center">${c.cor || ''}</td><td className="border border-slate-300 text-center text-slate-500" data-cls-count=${t.name}>${c.cls || ''}</td><td className="border border-slate-300 text-center text-red-600">${c.stb || ''}</td>
-            <td className="border border-slate-300 text-center">${c.mock || ''}</td><td className="border border-slate-300 text-center">${c.prev || ''}</td><td className="border border-slate-300 text-center font-bold bg-amber-50" data-total=${t.name}>${c.total}</td>
+            <td className="border border-slate-300 text-center font-semibold bg-sky-50" data-sum=${t.name}>${c.sum}</td><td className="border border-slate-300 text-center">${c.mock || ''}</td><td className="border border-slate-300 text-center">${c.prev || ''}</td><td className="border border-slate-300 text-center font-bold bg-amber-50" data-total=${t.name}>${c.total}</td>
           </tr>`; })}
           <tr className="bg-amber-50"><td className="sticky left-0 z-[5] bg-amber-100 border border-slate-300 px-2 font-bold text-amber-900">미배정</td>
             ${S.map((s, i) => html`<td key=${s.key} ...${dnd({ k: s.key, zone: true })} onClick=${e => { if (e.target === e.currentTarget && pick && pick.t) clickCell({ k: s.key, zone: true }); }} data-unfilled=${s.key} className=${`border border-slate-300 p-0.5 align-top ${dl(i)}`}><div className="flex flex-col gap-0.5">
               ${(chk.unfilled[s.key] || []).map(code => html`<span key=${code} ...${drag({ k: s.key, code })} onClick=${() => clickCell({ k: s.key, code })} data-chip=${`${s.key}|${code}`} className=${`px-1 rounded border text-[10px] cursor-grab whitespace-nowrap ${isPick(s.key, undefined, code) ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-amber-300 text-amber-900'}`}>${supText(code)}</span>`)}</div></td>`)}
-            <td colSpan="7" className="border border-slate-300 text-[10px] text-slate-500 px-2">교시별 남은 자리</td></tr>
+            <td colSpan="8" className="border border-slate-300 text-[10px] text-slate-500 px-2">교시별 남은 자리</td></tr>
         </tbody>
       </table>
     </div>
