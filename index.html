@@ -1049,7 +1049,7 @@ function supModel(sup, D, sx) {
   const { exams, tt } = ctx;
   const present = GRADES.filter(g => classesByGrade[g].length);
   const examAt = (g, s) => exams[g].filter(e => e.day === s.d && e.period === s.p);
-  const classOn = (d, g) => { const k = `${d}-${g}`; return sup.cls && k in sup.cls ? !!sup.cls[k] : present.includes(g) && !exams[g].some(e => e.day === d); };
+  const classOn = (d, g) => { const k = `${d}-${g}`; return sup.cls && k in sup.cls ? !!sup.cls[k] : !exams[g].some(e => e.day === d); };
   const examSubs = {}; GRADES.forEach(g => { examSubs[g] = [...new Set(exams[g].filter(e => !e.self).map(e => e.sub))]; });
   const tByName = {}; sup.teachers.forEach(t => { tByName[t.name] = t; });
   // 교사별 '같은 과목' 시험 = 시간표 약칭으로 찾은 과목 + 직접 추가 − 직접 뺌
@@ -1070,7 +1070,7 @@ function supModel(sup, D, sx) {
   const issues = [];
   const slots = D.slots.map((s, i) => {
     const key = `${s.d}-${s.p}`, wd = supWdOf(sup, tt, s.d), dt = supDateOf(tt, s.d, wd);
-    const classG = present.filter(g => classOn(s.d, g));
+    const classG = GRADES.filter(g => classOn(s.d, g));
     const subs = {}; GRADES.forEach(g => { subs[g] = examAt(g, s).map(e => e.sub); });
     const rooms = [];
     D.blocks.forEach(b => b.rooms.forEach(r => {
@@ -1275,8 +1275,8 @@ function supDayHTML(m, day, examTitle, chk) {
   const S = day.slots;
   const head = `<tr><th rowspan="2">번호</th><th rowspan="2">성명</th><th rowspan="2">담임반</th><th rowspan="2" class="mvh">이동반</th>${S.map(s => `<th class="ph">${s.p}교시</th>`).join('')}</tr><tr>${S.map(s => `<th class="ph" style="font-weight:400;font-size:6.5pt">${esc(s.time) || '감독'}</th>`).join('')}</tr>`;
   const body = m.teachers.map((t, i) => `<tr><td>${i + 1}</td><td class="nm">${esc(t.name)}</td><td>${esc(t.home || '')}</td><td class="mv">${esc(t.home ? m.moveRoomOf(t.home) : '')}</td>${S.map(s => { const c = supCell(m, s, t.name), e = chk && chk.cellErr[s.key] && chk.cellErr[s.key][t.name]; return `<td class="${supCls(c)}${e ? ' err' : ''}">${esc(c.text)}</td>`; }).join('')}</tr>`).join('');
-  const subRow = s => GRADES.filter(g => m.present.includes(g)).map(g => { const l = s.subs[g]; const t = s.classG.includes(g) ? '수업' : l.length ? l.join('/') : '-'; return `<td class="${l.length && !s.classG.includes(g) && l.some(x => !isSelf(x)) ? 'yl' : ''}">${esc(t)}</td>`; }).join('');
-  const ttb = `<div class="box"><div class="bh">시험 시간표</div><table><thead><tr><th>교시</th><th>시간</th>${m.present.map(g => `<th>${g}학년</th>`).join('')}</tr></thead><tbody>${S.map(s => `<tr><td>${s.p}교시</td><td style="font-size:7pt">${esc(s.time)}</td>${subRow(s)}</tr>`).join('')}</tbody></table></div>`;
+  const subRow = s => GRADES.map(g => { const l = s.subs[g]; const t = s.classG.includes(g) ? '수업' : l.length ? l.join('/') : '-'; return `<td class="${l.length && !s.classG.includes(g) && l.some(x => !isSelf(x)) ? 'yl' : ''}">${esc(t)}</td>`; }).join('');
+  const ttb = `<div class="box"><div class="bh">시험 시간표</div><table><thead><tr><th>교시</th><th>시간</th>${GRADES.map(g => `<th>${g}학년</th>`).join('')}</tr></thead><tbody>${S.map(s => `<tr><td>${s.p}교시</td><td style="font-size:7pt">${esc(s.time)}</td>${subRow(s)}</tr>`).join('')}</tbody></table></div>`;
   const who = (s, pred) => m.teachers.filter(t => pred(supCell(m, s, t.name))).map(t => t.name);
   const hqb = `<div class="box"><div class="bh">고사본부 대기 (♣ 출제자)</div><table><tbody>${S.map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => `${t.name}(${s.info[t.name].hq})`).join(', ') || '-')}</td></tr>`).join('')}</tbody></table></div>`;
   const posts = (m.sup.posts || []).filter(p => p.name);
@@ -1339,7 +1339,7 @@ function buildSupWorkbook(m, examTitle, counts) {
     const ws = wb.addWorksheet(sheetName(`${day.dot}_전체`), page());
     const cell = mk(ws);
     const R0 = 5 + nP + 1; // 오른쪽 안내 시작 열 (사이 1칸)
-    const RN = m.present.length;
+    const RN = GRADES.length;
     const lastCol = R0 + 1 + RN;
     ws.mergeCells(1, 1, 1, lastCol); cell(1, 1, `${examTitle} ${day.md} 감독표`, { size: 16, bold: true, border: false }); ws.getRow(1).height = 30.75;
     [['번호', 1], ['성명', 2], ['담임반', 3], ['이동반', 4]].forEach(([t, c]) => { ws.mergeCells(2, c, 3, c); cell(2, c, t, { bold: true, fill: c === 4 ? 'FFBBE76C' : 'FFE7E6E6' }); cell(3, c, null, { fill: c === 4 ? 'FFBBE76C' : 'FFE7E6E6' }); });
@@ -1352,10 +1352,10 @@ function buildSupWorkbook(m, examTitle, counts) {
     // 오른쪽: 시험 시간표 · 복도 위치 · 안내
     let r = 2;
     ws.mergeCells(r, R0, r, lastCol); cell(r, R0, '시험 시간표', { bold: true, fill: 'FF334155', color: 'FFFFFFFF' }); r++;
-    cell(r, R0, '교시', { bold: true, fill: 'FFE7E6E6' }); cell(r, R0 + 1, '시간', { bold: true, fill: 'FFE7E6E6' }); m.present.forEach((g, k) => cell(r, R0 + 2 + k, `${g}학년`, { bold: true, fill: 'FFE7E6E6' })); r++;
+    cell(r, R0, '교시', { bold: true, fill: 'FFE7E6E6' }); cell(r, R0 + 1, '시간', { bold: true, fill: 'FFE7E6E6' }); GRADES.forEach((g, k) => cell(r, R0 + 2 + k, `${g}학년`, { bold: true, fill: 'FFE7E6E6' })); r++;
     S.forEach(s => {
       cell(r, R0, `${s.p}교시`); cell(r, R0 + 1, s.time || '', { size: 8 });
-      m.present.forEach((g, k) => { const l = s.subs[g], cls = s.classG.includes(g); cell(r, R0 + 2 + k, cls ? '수업' : l.join('/') || '-', { size: 7, fill: !cls && l.some(x => !isSelf(x)) ? 'FFFFFF00' : undefined, align: { vertical: 'middle', horizontal: 'center', shrinkToFit: true } }); });
+      GRADES.forEach((g, k) => { const l = s.subs[g], cls = s.classG.includes(g); cell(r, R0 + 2 + k, cls ? '수업' : l.join('/') || '-', { size: 7, fill: !cls && l.some(x => !isSelf(x)) ? 'FFFFFF00' : undefined, align: { vertical: 'middle', horizontal: 'center', shrinkToFit: true } }); });
       r++;
     });
     r++;
@@ -1375,7 +1375,7 @@ function buildSupWorkbook(m, examTitle, counts) {
     [5.1, 8.8, 5.4, 5.4].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
     S.forEach((_, j) => { ws.getColumn(5 + j).width = 11.5; });
     ws.getColumn(R0 - 1).width = 1.8; ws.getColumn(R0).width = 6; ws.getColumn(R0 + 1).width = 12.8;
-    m.present.forEach((_, k) => { ws.getColumn(R0 + 2 + k).width = 12; });
+    GRADES.forEach((_, k) => { ws.getColumn(R0 + 2 + k).width = 12; });
   });
   // 2) 일자별 반별 감독표
   m.days.forEach(day => {
@@ -2736,10 +2736,10 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   const maxCP = Math.max(7, ...Object.values(sup.ttPeriods || {}));
   const condView = html`<div className="grid lg:grid-cols-2 gap-3">
     <${SupBox} id="supCls" title="시험 없이 수업하는 학년 (필수 반영)" sub="체크한 학년은 그날 정상 수업을 합니다. 그 학년 수업이 있는 교사는 해당 교시 감독에서 자동으로 빠지고, 그 학년 교실은 감독 자리가 없습니다. 처음에는 '그날 시험이 없는 학년'이 체크됩니다.">
-      ${!m.days.length ? html`<p className="text-xs text-slate-400">시험 시간표가 없습니다.</p>` : html`<table className="w-full text-xs border-collapse"><thead><tr className="bg-slate-50"><th className="border border-slate-200 p-1">일차</th><th className="border border-slate-200">요일 (교사 시간표)</th>${m.present.map(g => html`<th key=${g} className="border border-slate-200">${g}학년 수업</th>`)}</tr></thead>
+      ${!m.days.length ? html`<p className="text-xs text-slate-400">시험 시간표가 없습니다.</p>` : html`<table className="w-full text-xs border-collapse"><thead><tr className="bg-slate-50"><th className="border border-slate-200 p-1">일차</th><th className="border border-slate-200">요일 (교사 시간표)</th>${GRADES.map(g => html`<th key=${g} className="border border-slate-200">${g}학년 수업</th>`)}</tr></thead>
         <tbody>${m.days.map(d => html`<tr key=${d.d}><td className="border border-slate-200 p-1 text-center font-semibold">${d.md}</td>
           <td className="border border-slate-200 text-center"><select data-wd=${d.d} value=${(sup.wd || {})[d.d] || ''} onChange=${e => upd(x => { x.wd = { ...(x.wd || {}), [d.d]: e.target.value }; })} className="border border-slate-300 rounded px-1 py-0.5"><option value="">자동 (${d.awd || '?'})</option>${['월', '화', '수', '목', '금'].map(w => html`<option key=${w} value=${w}>${w}요일</option>`)}</select></td>
-          ${m.present.map(g => html`<td key=${g} className="border border-slate-200 text-center"><input type="checkbox" data-cls=${`${d.d}-${g}`} checked=${d.slots[0].classG.includes(g)} onChange=${e => upd(x => { x.cls = { ...(x.cls || {}), [`${d.d}-${g}`]: e.target.checked }; })} /></td>`)}</tr>`)}</tbody></table>`}
+          ${GRADES.map(g => html`<td key=${g} className="border border-slate-200 text-center"><input type="checkbox" data-cls=${`${d.d}-${g}`} checked=${d.slots[0].classG.includes(g)} onChange=${e => upd(x => { x.cls = { ...(x.cls || {}), [`${d.d}-${g}`]: e.target.checked }; })} /></td>`)}</tr>`)}</tbody></table>`}
     <//>
     <${SupBox} id="supPmap" title="시험 교시 ↔ 수업 교시" sub="시험 교시 시간에 겹치는 수업 교시를 고르세요. 수업하는 학년의 이 교시 수업이 있는 교사를 감독에서 뺍니다.">
       <div className="space-y-1.5">${(examPs.length ? examPs : [1, 2, 3]).map(p => html`<div key=${p} className="flex flex-wrap items-center gap-1.5 text-xs"><span className="w-14 font-bold">시험 ${p}교시</span><span className="text-slate-400">→ 수업</span>
