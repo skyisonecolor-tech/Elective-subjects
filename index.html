@@ -962,11 +962,639 @@ function pagesLink(gh, version) {
   return base.replace(/\/?$/, '/') + p + (version ? `?v=${version}` : '');
 }
 
+/* ============================== 감독 시간표 ==============================
+ * 교사 주간시간표 → 교사 명단 · 시험 시간표 + 고사실 통계 → 교시마다 필요한 감독 자리
+ * 자리 코드  R|교실|정·부 (교실 감독) · C|위치 (복도 감독) · W|번호 (대기)
+ * 자동 상태  제외(관리·개인 사유) · 수업(시험 없는 학년 수업) · ♣(출제자, 고사본부 대기)
+ *            → 편성표에 저장하지 않고 입력이 바뀔 때마다 다시 계산한다 */
+const DEFAULT_POSTS = [
+  { name: '2층 후관', desc: '고사본부 앞', hq: true }, { name: '1층 본관', desc: '' }, { name: '2층 본관', desc: '' },
+  { name: '3층 본관', desc: '' }, { name: '4층 본관', desc: '' }, { name: '5층 본관', desc: '' },
+];
+const DEFAULT_SUP_NOTE = [
+  '< 감독 배치 안내 및 시험 중 유의사항 >',
+  '● 담당 교과 시험 시간에 출제 교사(♣)는 시험본부에서 대기합니다.',
+  '● 정감독 - 문제지 인수, 시험 진행, 답안지 회수·확인, 결시자 처리',
+  '● 부감독 - 정감독을 도와 부정행위 예방, 답안지 확인',
+  '● 자기주도학습감독 - 정위치에서 학생 지도',
+  '● 복도감독 - 복도 순회, 비상시 연락',
+  '● 대기감독 - 시험 시작 5분 전부터 교무실에서 대기',
+].join('\n');
+const defaultSup = () => ({ teachers: [], ttLabel: '', wd: {}, cls: {}, pmap: { 1: [1], 2: [2], 3: [3], 4: [4] }, posts: DEFAULT_POSTS.map(p => ({ ...p })), standby: 3, prevK: 2, note: DEFAULT_SUP_NOTE, assign: {}, genAt: '' });
+const newTeacher = (name, hours = 0, tt = {}) => ({ name, hours, tt, home: '', prev: 0, mock: 0, ex: { mode: '', days: {}, reason: '' }, subAdd: [], subDel: [] });
+const splitNames = s => String(s || '').split(/[\/,·;\s]+/).map(x => x.trim()).filter(Boolean);
+const supText = (code, short) => { const [k, a, b] = String(code).split('|'); return k === 'R' ? `${a}(${b})` : k === 'C' ? a : k === 'W' ? `대기${a}` : code; };
+
+// 교사 주간시간표: 위쪽에 요일(월~금) 행, 그 아래 교시 번호 행, 첫 열 '이름(시수)', 칸은 '302\nB_언매'(학년·반 + 블록_과목 약칭)
+function parseTTCell(v) {
+  const s = String(v ?? '').trim(); if (!s) return null;
+  const parts = s.split(/[\r\n]+|\s+/).filter(Boolean);
+  const m = parts[0].match(/^(\d)(\d{1,2})$/);
+  const sub = x => x.replace(/^[A-Za-z]{1,2}[_\-]/, '').trim();
+  return m ? [+m[1], +m[2], sub(parts.slice(1).join(' '))] : [0, 0, sub(s)];
+}
+function parseTeacherTT(rows) {
+  let hr = -1;
+  for (let r = 0; r < Math.min(rows.length, 12); r++) if (rows[r].filter(v => /^[월화수목금]/.test(String(v).trim())).length >= 3) { hr = r; break; }
+  if (hr < 0) return null;
+  const dayRow = rows[hr], pRow = rows[hr + 1] || [];
+  const cols = []; let cur = '';
+  for (let c = 1; c < Math.max(dayRow.length, pRow.length); c++) {
+    const t = String(dayRow[c] ?? '').trim(); if (/^[월화수목금토]/.test(t)) cur = t[0];
+    const p = parseInt(String(pRow[c] ?? '').trim(), 10);
+    if (cur && p >= 1 && p <= 10) cols.push({ c, wd: cur, p });
+  }
+  if (!cols.length) return null;
+  const teachers = [], seen = {};
+  for (let r = hr + 2; r < rows.length; r++) {
+    const raw = String(rows[r][0] ?? '').trim(); if (!raw) continue;
+    const m = raw.match(/^(.+?)\s*\(\s*(\d+)\s*\)\s*$/);
+    let name = (m ? m[1] : raw).replace(/\s+/g, '');
+    if (!/^[가-힣A-Za-z]{2,12}$/.test(name) || /^(합계|소계|계|비고|교사|성명|이름|담당)$/.test(name)) continue;
+    if (seen[name]) { seen[name]++; name += seen[name]; } else seen[name] = 1;
+    const tt = {};
+    cols.forEach(({ c, wd, p }) => { const v = parseTTCell(rows[r][c]); if (v) tt[`${wd}-${p}`] = v; });
+    teachers.push({ name, hours: m ? +m[2] : Object.keys(tt).length, tt });
+  }
+  const periods = {}; cols.forEach(x => { periods[x.wd] = Math.max(periods[x.wd] || 0, x.p); });
+  return teachers.length ? { teachers, periods } : null;
+}
+// 시간표 약칭('언매', '확통', '국어2')이 시험 과목명('언어와 매체', '확률과 통계', '공통국어2')과 같은 과목인지
+function abbrMatch(abbr, sub) {
+  const fix = x => norm(x).replace(/[()（）\[\]·.,]/g, '').replace(/iii$/, '3').replace(/ii$/, '2').replace(/i$/, '1');
+  let a = fix(abbr), b = fix(sub); if (!a || !b) return false;
+  if (a === b) return true;
+  const da = a.match(/\d+$/), db = b.match(/\d+$/);
+  if (da && db && da[0] !== db[0]) return false;
+  a = a.replace(/\d+$/, ''); b = b.replace(/\d+$/, '');
+  if (a.length < 2) return a === b;
+  if (b.includes(a)) return true;
+  if (a[0] !== b[0]) return false;
+  let j = 0; for (const ch of b) if (ch === a[j]) j++;
+  return j === a.length;
+}
+function supWdOf(sup, tt, d) {
+  if (sup.wd && sup.wd[d]) return sup.wd[d];
+  for (const g of GRADES) { const m = String(tt[g].labels[d] || '').match(/([월화수목금토일])\s*요일|\(\s*([월화수목금토일])\s*\)/); if (m) return m[1] || m[2]; }
+  return '';
+}
+function supDateOf(tt, d, wd) {
+  for (const g of GRADES) { const m = String(tt[g].labels[d] || '').match(/(\d+)\s*월\s*(\d+)\s*일/); if (m) return { md: `${m[1]}월 ${m[2]}일${wd ? `(${wd})` : ''}`, dot: `${m[1]}.${m[2]}.${wd ? `(${wd})` : ''}`, sh: `${m[1]}/${m[2]}${wd ? `(${wd})` : ''}` }; }
+  return { md: `${d}일차`, dot: `${d}일차`, sh: `${d}일차` };
+}
+
+// 입력 전체 → 교시별 필요 자리·교사 상태
+function supModel(sup, D, sx) {
+  const { ctx, roomMap, editors, classesByGrade, times } = sx;
+  const { exams, tt } = ctx;
+  const present = GRADES.filter(g => classesByGrade[g].length);
+  const examAt = (g, s) => exams[g].filter(e => e.day === s.d && e.period === s.p);
+  const classOn = (d, g) => { const k = `${d}-${g}`; return sup.cls && k in sup.cls ? !!sup.cls[k] : present.includes(g) && !exams[g].some(e => e.day === d); };
+  const examSubs = {}; GRADES.forEach(g => { examSubs[g] = [...new Set(exams[g].filter(e => !e.self).map(e => e.sub))]; });
+  const tByName = {}; sup.teachers.forEach(t => { tByName[t.name] = t; });
+  // 교사별 '같은 과목' 시험 = 시간표 약칭으로 찾은 과목 + 직접 추가 − 직접 뺌
+  const autoSubs = {}, subsOf = {}, teachSum = {};
+  sup.teachers.forEach(t => {
+    const ab = {}; Object.values(t.tt || {}).forEach(([g, , s]) => { if (g && s) (ab[g] = ab[g] || new Set()).add(s); });
+    teachSum[t.name] = Object.keys(ab).sort().map(g => `${g}학년 ${[...ab[g]].join('·')}`).join(' / ');
+    const auto = new Set();
+    GRADES.forEach(g => examSubs[g].forEach(sub => { if (ab[g] && [...ab[g]].some(a => abbrMatch(a, sub))) auto.add(`${g}|${norm(sub)}`); }));
+    autoSubs[t.name] = auto;
+    const set = new Set(auto); (t.subAdd || []).forEach(k => set.add(k)); (t.subDel || []).forEach(k => set.delete(k));
+    subsOf[t.name] = set;
+  });
+  // 담임: 자기 반 교실 + 자기 반 이동반 학생이 시험 보러 가는 교실은 감독 불가
+  const moveRoomOf = home => Object.keys(roomMap).find(h => roomMap[h] === home) || '';
+  const forbid = {};
+  sup.teachers.forEach(t => { if (t.home) forbid[t.name] = new Set([t.home, moveRoomOf(t.home)].filter(Boolean)); });
+  const issues = [];
+  const slots = D.slots.map((s, i) => {
+    const key = `${s.d}-${s.p}`, wd = supWdOf(sup, tt, s.d), dt = supDateOf(tt, s.d, wd);
+    const classG = present.filter(g => classOn(s.d, g));
+    const subs = {}; GRADES.forEach(g => { subs[g] = examAt(g, s).map(e => e.sub); });
+    const rooms = [];
+    D.blocks.forEach(b => b.rooms.forEach(r => {
+      if (classG.includes(r.g)) return;
+      const x = r.cells[i];
+      if (!(x.n > 0 || examAt(r.g, s).length)) return;
+      rooms.push({ room: r.host, n: x.n, need: x.over ? 2 : 1, self: x.n === 0 });
+    }));
+    const hq = {};
+    GRADES.forEach(g => {
+      const ns = splitNames(editors[`${g}-${s.d}-${s.p}`]); if (!ns.length) return;
+      const l = examAt(g, s).filter(e => !e.self).map(e => e.sub);
+      ns.forEach((n, j) => {
+        if (!tByName[n]) { issues.push(`출제자 '${n}' (${dt.md} ${s.p}교시 ${g}학년)을 교사 명단에서 찾지 못했습니다.`); return; }
+        const label = l.length === ns.length ? l[j] : l.join('/');
+        hq[n] = hq[n] ? `${hq[n]}/${label}` : label;
+      });
+    });
+    const pos = [];
+    rooms.forEach(r => { pos.push(`R|${r.room}|정`); if (r.need > 1) pos.push(`R|${r.room}|부`); });
+    (sup.posts || []).forEach(p => { if (p.name) pos.push(`C|${p.name}`); });
+    for (let k = 1; k <= (+sup.standby || 0); k++) pos.push(`W|${k}`);
+    const cps = (sup.pmap && sup.pmap[s.p] && sup.pmap[s.p].length) ? sup.pmap[s.p] : [s.p];
+    const info = {};
+    sup.teachers.forEach(t => {
+      const o = {}, ex = t.ex || {};
+      if (ex.mode === 'all' || (ex.mode === 'days' && ex.days && ex.days[s.d])) o.ex = (ex.reason || '').trim() || '제외';
+      if (wd && classG.length) {
+        const hit = cps.map(cp => (t.tt || {})[`${wd}-${cp}`]).find(v => v && classG.includes(v[0]));
+        if (hit) o.busy = `${hit[0]}학년 수업(${hit[0]}-${hit[1]} ${hit[2]})`;
+      }
+      if (hq[t.name]) o.hq = hq[t.name];
+      const same = GRADES.flatMap(g => examAt(g, s).filter(e => !e.self && subsOf[t.name].has(`${g}|${norm(e.sub)}`)).map(e => e.sub));
+      if (same.length) o.same = same;
+      info[t.name] = o;
+    });
+    return { key, i, d: s.d, p: s.p, wd, ...dt, time: times[s.p] || '', subs, classG, rooms, pos, info };
+  });
+  const days = []; slots.forEach(s => { const l = days[days.length - 1]; if (l && l.d === s.d) l.slots.push(s); else days.push({ d: s.d, md: s.md, dot: s.dot, sh: s.sh, wd: s.wd, awd: supWdOf({ wd: {} }, tt, s.d), slots: [s] }); });
+  const sorted = [...sup.teachers].sort((a, b) => a.name.localeCompare(b.name, 'ko')); // 감독표는 교사명 가나다순
+  return { slots, days, teachers: sorted, autoSubs, subsOf, teachSum, forbid, moveRoomOf, issues, examSubs, sup, present, classes: classesByGrade };
+}
+// 칸 하나에 이 교사가 이 자리를 맡을 수 있는지 (안 되면 이유)
+function supCan(m, s, name, code) {
+  const o = s.info[name]; if (!o) return `${name} 선생님은 교사 명단에 없습니다.`;
+  if (!code) return null;
+  if (o.ex) return `${name} 선생님은 ${s.md} '${o.ex}'(으)로 감독에서 빠집니다.`;
+  if (o.busy) return `${name} 선생님은 ${s.md} ${s.p}교시에 ${o.busy}이 있습니다.`;
+  if (o.hq) return `${name} 선생님은 ${o.hq} 출제자라 고사본부(♣)에서 대기합니다.`;
+  const [k, room] = code.split('|');
+  if (k === 'R' && o.same) return `${name} 선생님은 같은 과목(${o.same.join(', ')}) 시험 시간이라 교실 감독을 맡을 수 없습니다. 복도 감독만 가능합니다.`;
+  if (k === 'R' && m.forbid[name] && m.forbid[name].has(room)) { const t = m.teachers.find(x => x.name === name); return `${name} 선생님은 ${t.home}반 담임이라 ${room} 교실(담임반 또는 담임반 학생이 이동하는 교실)을 감독할 수 없습니다.`; }
+  if (k === 'W' && o.same) return `${name} 선생님은 같은 과목 시험 시간이라 대기 감독(교실 투입 가능)을 맡지 않습니다.`;
+  return null;
+}
+// 화면·출력용 칸 상태
+function supCell(m, s, name) {
+  const o = s.info[name] || {}, code = ((m.sup.assign || {})[s.key] || {})[name] || '';
+  if (o.ex) return { kind: 'X', text: o.ex, fixed: true, code };
+  if (o.busy) return { kind: 'L', text: '수업', title: o.busy, fixed: true, code };
+  if (o.hq) return { kind: 'H', text: `♣ ${o.hq}`, short: '♣', fixed: true, code };
+  if (!code) return { kind: '', text: '', code, same: o.same };
+  return { kind: code[0], text: supText(code), code, same: o.same };
+}
+// 편성표 점검: 규칙 위반 칸, 빈 자리
+function supCheck(m) {
+  const cellErr = {}, unfilled = {}, list = [...m.issues];
+  m.slots.forEach(s => {
+    const A = (m.sup.assign || {})[s.key] || {}, used = {};
+    Object.entries(A).forEach(([t, code]) => {
+      if (!code) return;
+      const err = !s.info[t] ? `${t} 선생님은 교사 명단에 없습니다.` : !s.pos.includes(code) ? `이 교시에는 '${supText(code)}' 자리가 없습니다. (시간표·통계가 바뀜)` : used[code] ? `'${supText(code)}' 자리가 ${used[code]} 선생님과 겹칩니다.` : supCan(m, s, t, code);
+      if (!used[code]) used[code] = t;
+      if (err) { (cellErr[s.key] = cellErr[s.key] || {})[t] = err; list.push(`${s.md} ${s.p}교시 — ${err}`); }
+    });
+    const taken = new Set(Object.values(A));
+    const miss = s.pos.filter(c => !taken.has(c));
+    if (miss.length) unfilled[s.key] = miss;
+  });
+  return { cellErr, unfilled, list, nErr: Object.values(cellErr).reduce((a, o) => a + Object.keys(o).length, 0), nMiss: Object.values(unfilled).reduce((a, l) => a + l.length, 0) };
+}
+// 교사별 횟수 (교실·복도는 감독 횟수, 대기는 따로)
+function supCounts(m) {
+  const C = {};
+  m.teachers.forEach(t => { C[t.name] = { room: 0, cor: 0, stb: 0, hq: 0, day: {}, mock: +t.mock || 0, prev: +t.prev || 0 }; });
+  m.slots.forEach(s => {
+    m.teachers.forEach(t => { if (s.info[t.name] && s.info[t.name].hq && !s.info[t.name].ex && !s.info[t.name].busy) C[t.name].hq++; });
+    Object.entries((m.sup.assign || {})[s.key] || {}).forEach(([n, code]) => {
+      const c = C[n]; if (!c || !code) return;
+      if (code[0] === 'R') c.room++; else if (code[0] === 'C') c.cor++; else if (code[0] === 'W') c.stb++;
+      if (code[0] === 'R' || code[0] === 'C') c.day[s.d] = (c.day[s.d] || 0) + 1;
+    });
+  });
+  Object.values(C).forEach(c => { c.now = c.room + c.cor; c.sum = c.now + c.mock; c.total = c.sum + c.prev; });
+  return C;
+}
+// 자동 편성: 교시 순서대로 채운 뒤, 많이 맡은 교사의 자리를 덜 맡은 교사에게 넘기며 고르게 맞춘다
+//  부담 = 이번 감독 수 + (이전 감독+모의고사 지원 − 평균, ±prevK 이내) · 같은 날 몰림은 μ로 벌점
+function supGenerate(m) {
+  const T = m.teachers.map(t => t.name), K = Math.max(0, +m.sup.prevK || 0), MU = 0.7;
+  const act = m.teachers.filter(t => (t.ex || {}).mode !== 'all');
+  const base = {}; m.teachers.forEach(t => { base[t.name] = (+t.prev || 0) + (+t.mock || 0); });
+  const mean = act.length ? act.reduce((a, t) => a + base[t.name], 0) / act.length : 0;
+  const L = {}, dc = {}, stb = {};
+  T.forEach(n => { L[n] = Math.max(-K, Math.min(K, base[n] - mean)); dc[n] = {}; stb[n] = 0; });
+  const h = (n, s) => { let x = 7; for (const ch of n + s.key) x = (x * 31 + ch.charCodeAt(0)) % 997; return x / 997; };
+  const cost = (n, s) => L[n] * 10 + MU * 10 * (dc[n][s.d] || 0) + h(n, s);
+  const counted = code => code[0] === 'R' || code[0] === 'C';
+  const out = {};
+  const put = (A, n, code, s) => { A[n] = code; if (counted(code)) { L[n]++; dc[n][s.d] = (dc[n][s.d] || 0) + 1; } else stb[n]++; };
+  const hqPosts = new Set((m.sup.posts || []).filter(p => p.hq).map(p => `C|${p.name}`));
+  m.slots.forEach(s => {
+    const A = out[s.key] = {};
+    const free = n => { const o = s.info[n]; return o && !o.ex && !o.busy && !o.hq && !A[n]; };
+    const byCost = arr => arr.slice().sort((a, b) => cost(a, s) - cost(b, s));
+    const posts = s.pos.filter(c => c[0] === 'C').sort((a, b) => (hqPosts.has(b) ? 1 : 0) - (hqPosts.has(a) ? 1 : 0));
+    // 1) 같은 과목 교사 → 복도 (고사본부 앞 먼저)
+    byCost(T.filter(n => free(n) && s.info[n].same)).forEach(n => { if (posts.length) put(A, n, posts.shift(), s); });
+    // 2) 교실 감독 (정 → 부)
+    s.pos.filter(c => c[0] === 'R').forEach(code => { const n = byCost(T.filter(x => free(x) && !supCan(m, s, x, code)))[0]; if (n) put(A, n, code, s); });
+    // 3) 남은 복도
+    posts.forEach(code => { const n = byCost(T.filter(free))[0]; if (n) put(A, n, code, s); });
+    // 4) 대기 (대기를 적게 맡은 순)
+    s.pos.filter(c => c[0] === 'W').forEach(code => { const n = T.filter(x => free(x) && !s.info[x].same).sort((a, b) => stb[a] - stb[b] || cost(a, s) - cost(b, s))[0]; if (n) put(A, n, code, s); });
+  });
+  // 5) 고르게 맞추기
+  for (let it = 0; it < 60; it++) {
+    let moved = false;
+    m.slots.forEach(s => {
+      const A = out[s.key];
+      Object.keys(A).forEach(n => {
+        const code = A[n]; if (!code || !counted(code)) return;
+        if (code[0] === 'C' && s.info[n].same) return; // 같은 과목 교사의 복도 감독은 그대로
+        let best = null, bestD = -1e-9;
+        T.forEach(u => {
+          if (u === n) return;
+          const o = s.info[u]; if (!o || o.ex || o.busy || o.hq) return;
+          const cu = A[u] || '';
+          if (cu && cu[0] !== 'W') return;
+          if (supCan(m, s, u, code)) return;
+          if (cu && supCan(m, s, n, cu)) return;
+          const dlt = (L[u] - L[n] + 1) + MU * ((dc[u][s.d] || 0) - (dc[n][s.d] || 0) + 1);
+          if (dlt < bestD) { bestD = dlt; best = u; }
+        });
+        if (best) {
+          const cu = A[best] || '';
+          if (cu) A[n] = cu; else delete A[n];
+          A[best] = code;
+          L[n]--; dc[n][s.d]--; L[best]++; dc[best][s.d] = (dc[best][s.d] || 0) + 1;
+          moved = true;
+        }
+      });
+    });
+    if (!moved) break;
+  }
+  return out;
+}
+// 이전 감독표(이 프로그램의 '교사(전체)' 시트 등)에서 교사별 '총계' 읽기
+function parsePrevCounts(wb) {
+  const found = {};
+  wb.SheetNames.forEach(name => {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: '', raw: false });
+    for (let r = 0; r < Math.min(rows.length, 8); r++) {
+      const row = rows[r].map(v => String(v).replace(/\s+/g, ''));
+      let tc = -1; row.forEach((v, c) => { if (/총계$/.test(v)) tc = c; });
+      if (tc < 0) continue;
+      let nc = row.findIndex(v => /^(교사|성명|이름|교사명)$/.test(v)); if (nc < 0) nc = 0;
+      for (let k = r + 1; k < rows.length; k++) {
+        const nm = String(rows[k][nc] ?? '').replace(/\(.*?\)/g, '').replace(/\s+/g, '');
+        const v = parseFloat(String(rows[k][tc] ?? '').replace(/[^\d.\-]/g, ''));
+        if (/^[가-힣A-Za-z]{2,12}$/.test(nm) && !isNaN(v) && !(nm in found)) found[nm] = v;
+      }
+      break;
+    }
+  });
+  return found;
+}
+
+/* ---- 화면·인쇄용 HTML (A4 세로, 폭 190mm) ---- */
+const SUP_CSS = `
+.sup{font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;color:#000;background:#fff;width:190mm;font-size:8pt}
+.sup .ttl{font-size:14pt;font-weight:900;text-align:center;margin:0 0 2.5mm;letter-spacing:-.2pt}
+.sup .wrap{display:flex;gap:2.5mm;align-items:flex-start}
+.sup table{border-collapse:collapse}
+.sup th,.sup td{border:1px solid #444;padding:.6pt 2pt;text-align:center;white-space:nowrap;line-height:1.2;height:11pt}
+.sup thead th{background:#E7E6E6;font-weight:700}
+.sup th.ph{background:#C49DD6}.sup th.mvh{background:#BBE76C}.sup td.mv{background:#F1FBE6}
+.sup td.nm{font-weight:700}.sup td.lb{font-weight:700;background:#F8FAFC}
+.sup td.cC{background:#CDF2E4}.sup td.cH{background:#42C7F1;font-weight:700}.sup td.cX{background:#FFE7D8}.sup td.cW{color:#E00000;font-weight:800}.sup td.cL{color:#94a3b8;background:#F1F5F9}
+.sup td.err{outline:2px solid #e11d48;outline-offset:-2px}
+.sup .right{flex:1 1 auto;display:flex;flex-direction:column;gap:2mm;min-width:0}
+.sup .box{border:1px solid #444}.sup .bh{background:#334155;color:#fff;font-weight:700;padding:1.5pt 4pt}
+.sup .box table{width:100%}.sup .box td,.sup .box th{white-space:normal;border-color:#888}
+.sup td.yl{background:#FFFF00}
+.sup .note{white-space:pre-wrap;padding:3pt 4pt;line-height:1.5;font-size:7.5pt}
+.sup .z{color:#bbb}.sup .full{width:100%}
+.sup .cnt td{font-weight:700}.sup td.tot{background:#FFF7D6;font-weight:800}
+.sup .sub{font-size:6.5pt;font-weight:400;color:#333;white-space:normal;line-height:1.1}
+`;
+const supCls = c => (c.kind ? `c${c.kind}` : '');
+function supDayHTML(m, day, examTitle, chk) {
+  const S = day.slots;
+  const head = `<tr><th rowspan="2">번호</th><th rowspan="2">성명</th><th rowspan="2">담임반</th><th rowspan="2" class="mvh">이동반</th>${S.map(s => `<th class="ph">${s.p}교시</th>`).join('')}</tr><tr>${S.map(s => `<th class="ph" style="font-weight:400;font-size:6.5pt">${esc(s.time) || '감독'}</th>`).join('')}</tr>`;
+  const body = m.teachers.map((t, i) => `<tr><td>${i + 1}</td><td class="nm">${esc(t.name)}</td><td>${esc(t.home || '')}</td><td class="mv">${esc(t.home ? m.moveRoomOf(t.home) : '')}</td>${S.map(s => { const c = supCell(m, s, t.name), e = chk && chk.cellErr[s.key] && chk.cellErr[s.key][t.name]; return `<td class="${supCls(c)}${e ? ' err' : ''}">${esc(c.text)}</td>`; }).join('')}</tr>`).join('');
+  const subRow = s => GRADES.filter(g => m.present.includes(g)).map(g => { const l = s.subs[g]; const t = s.classG.includes(g) ? '수업' : l.length ? l.join('/') : '-'; return `<td class="${l.length && !s.classG.includes(g) && l.some(x => !isSelf(x)) ? 'yl' : ''}">${esc(t)}</td>`; }).join('');
+  const ttb = `<div class="box"><div class="bh">시험 시간표</div><table><thead><tr><th>교시</th><th>시간</th>${m.present.map(g => `<th>${g}학년</th>`).join('')}</tr></thead><tbody>${S.map(s => `<tr><td>${s.p}교시</td><td style="font-size:7pt">${esc(s.time)}</td>${subRow(s)}</tr>`).join('')}</tbody></table></div>`;
+  const who = (s, pred) => m.teachers.filter(t => pred(supCell(m, s, t.name))).map(t => t.name);
+  const hqb = `<div class="box"><div class="bh">고사본부 대기 (♣ 출제자)</div><table><tbody>${S.map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => `${t.name}(${s.info[t.name].hq})`).join(', ') || '-')}</td></tr>`).join('')}</tbody></table></div>`;
+  const posts = (m.sup.posts || []).filter(p => p.name);
+  const corb = posts.length ? `<div class="box"><div class="bh">복도 감독</div><table><thead><tr><th>위치</th>${S.map(s => `<th>${s.p}교시</th>`).join('')}</tr></thead><tbody>${posts.map(p => `<tr><td class="lb">${esc(p.name)}${p.desc ? `<div class="sub">${esc(p.desc)}</div>` : ''}</td>${S.map(s => `<td>${esc(who(s, c => c.code === `C|${p.name}`).join(', '))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '';
+  const nW = +m.sup.standby || 0;
+  const stbb = nW ? `<div class="box"><div class="bh">대기 감독 (교무실)</div><table><tbody>${S.map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(Array.from({ length: nW }, (_, k) => { const n = who(s, c => c.code === `W|${k + 1}`)[0]; return n ? `${k + 1}. ${n}` : ''; }).filter(Boolean).join('  ') || '-')}</td></tr>`).join('')}</tbody></table></div>` : '';
+  const note = `<div class="box note">${esc(m.sup.note || '')}\n\n<b>&lt;기호 표시&gt;</b> ♣ 출제 교과 시험(고사본부 대기) · <span style="background:#CDF2E4">복도</span> · <span style="color:#E00000;font-weight:800">대기</span> · <span style="background:#FFE7D8">관리·제외</span> · (정) 정감독 (부) 부감독</div>`;
+  return `<div class="sup"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 감독표</div><div class="wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table><div class="right">${ttb}${hqb}${corb}${stbb}${note}</div></div></div>`;
+}
+function supClassHTML(m, day, examTitle) {
+  const S = day.slots;
+  const nameOf = (s, code) => m.teachers.filter(t => ((m.sup.assign || {})[s.key] || {})[t.name] === code).map(t => t.name).join(', ');
+  const head = `<tr><th rowspan="2" style="width:9mm">학년</th><th rowspan="2">반</th>${S.map(s => `<th colspan="2" class="ph">${s.p}교시 <span style="font-weight:400;font-size:6.5pt">${esc(s.time)}</span></th>`).join('')}</tr><tr>${S.map(() => '<th>제1감독(정)</th><th>제2감독(부)</th>').join('')}</tr>`;
+  const rows = [];
+  m.present.forEach(g => {
+    const cs = m.classes[g] || [];
+    cs.forEach((c, ci) => {
+      const room = clsKey(g, c);
+      rows.push(`<tr>${ci === 0 ? `<td rowspan="${cs.length}" class="lb">${g}학년</td>` : ''}<td class="lb">${c}반</td>${S.map(s => {
+        if (s.classG.includes(g) && !s.rooms.some(r => r.room === room)) return '<td colspan="2" class="cL">수업</td>';
+        const r = s.rooms.find(x => x.room === room); if (!r) return '<td colspan="2" class="z">-</td>';
+        return `<td>${esc(nameOf(s, `R|${room}|정`))}</td><td>${r.need > 1 ? esc(nameOf(s, `R|${room}|부`)) : '<span class="z">-</span>'}</td>`;
+      }).join('')}</tr>`);
+    });
+  });
+  (m.sup.posts || []).filter(p => p.name).forEach((p, i) => rows.push(`<tr>${i === 0 ? `<td rowspan="${(m.sup.posts || []).filter(x => x.name).length}" class="lb cC">복도</td>` : ''}<td class="lb cC">${esc(p.name)}</td>${S.map(s => `<td colspan="2">${esc(nameOf(s, `C|${p.name}`))}</td>`).join('')}</tr>`));
+  if (+m.sup.standby) rows.push(`<tr><td colspan="2" class="lb">대기</td>${S.map(s => `<td colspan="2" class="cW">${esc(Array.from({ length: +m.sup.standby }, (_, k) => nameOf(s, `W|${k + 1}`)).filter(Boolean).join(', '))}</td>`).join('')}</tr>`);
+  rows.push(`<tr><td colspan="2" class="lb cH">본부 ♣</td>${S.map(s => `<td colspan="2" style="white-space:normal">${esc(m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '))}</td>`).join('')}</tr>`);
+  return `<div class="sup"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 반별 감독표</div><table class="full"><thead>${head}</thead><tbody>${rows.join('')}</tbody></table></div>`;
+}
+function supTeacherHTML(m, examTitle, counts, chk) {
+  const S = m.slots;
+  const dl = i => (i > 0 && S[i - 1].d !== S[i].d ? ' style="border-left:2px solid #000"' : '');
+  const head = `<tr><th rowspan="2">교사</th>${m.days.map(d => `<th colspan="${d.slots.length}" style="background:#DCE6F1">${esc(d.sh)}</th>`).join('')}<th rowspan="2">교실</th><th rowspan="2">모고</th><th rowspan="2">복도</th><th rowspan="2">합계</th><th rowspan="2">이전</th><th rowspan="2" class="tot">총계</th></tr>`
+    + `<tr>${S.map((s, i) => `<th class="ph"${dl(i)}>${s.p}교시<div class="sub">${esc(GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join(' · '))}</div></th>`).join('')}</tr>`;
+  const body = m.teachers.map(t => { const c = counts[t.name]; return `<tr><td class="nm">${esc(t.name)}</td>${S.map((s, i) => { const x = supCell(m, s, t.name), e = chk && chk.cellErr[s.key] && chk.cellErr[s.key][t.name]; return `<td class="${supCls(x)}${e ? ' err' : ''}"${dl(i)}>${esc(x.short || x.text)}</td>`; }).join('')}<td>${c.room}</td><td>${c.mock || ''}</td><td>${c.cor || ''}</td><td>${c.sum}</td><td>${c.prev || ''}</td><td class="tot">${c.total}</td></tr>`; }).join('');
+  return `<div class="sup"><div class="ttl">${esc(examTitle)} 감독 편성표 (교사별)</div><table class="full"><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+}
+function supAllPages(m, examTitle, counts) {
+  return [...m.days.map(d => supDayHTML(m, d, examTitle)), ...m.days.map(d => supClassHTML(m, d, examTitle)), supTeacherHTML(m, examTitle, counts)];
+}
+
+/* ---- 엑셀 (A4 세로, 시트마다 1장에 맞춤) ---- */
+function buildSupWorkbook(m, examTitle, counts) {
+  const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템'; wb.created = new Date();
+  const B = XL.border, CEN = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  const page = (o = {}) => ({ pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 1, horizontalCentered: true, margins: { left: .3, right: .3, top: .35, bottom: .35, header: .2, footer: .2 }, ...o } });
+  const mk = ws => (r, c, v, o = {}) => {
+    const x = ws.getCell(r, c);
+    if (v !== null) { x.value = v; x.font = XL.font(o.size || 9, o.bold, o.color); }
+    x.alignment = o.align || CEN; if (o.border !== false) x.border = B; if (o.fill) x.fill = XL.fill(o.fill);
+    return x;
+  };
+  const kindFill = { C: 'FFCDF2E4', H: 'FF42C7F1', X: 'FFFFE7D8', L: 'FFF1F5F9' };
+  const codeCell = (cell, r, c, x) => cell(r, c, x.text, { fill: kindFill[x.kind], bold: x.kind === 'W' || x.kind === 'H', color: x.kind === 'W' ? 'FFE00000' : x.kind === 'L' ? 'FF94A3B8' : undefined });
+  const sheetName = s => s.replace(/[\\\/\?\*\[\]:]/g, '').slice(0, 31);
+  // 1) 일자별 전체 감독표
+  m.days.forEach(day => {
+    const S = day.slots, nP = S.length;
+    const ws = wb.addWorksheet(sheetName(`${day.dot}_전체`), page());
+    const cell = mk(ws);
+    const R0 = 5 + nP + 1; // 오른쪽 안내 시작 열 (사이 1칸)
+    const RN = m.present.length;
+    const lastCol = R0 + 1 + RN;
+    ws.mergeCells(1, 1, 1, lastCol); cell(1, 1, `${examTitle} ${day.md} 감독표`, { size: 16, bold: true, border: false }); ws.getRow(1).height = 30.75;
+    [['번호', 1], ['성명', 2], ['담임반', 3], ['이동반', 4]].forEach(([t, c]) => { ws.mergeCells(2, c, 3, c); cell(2, c, t, { bold: true, fill: c === 4 ? 'FFBBE76C' : 'FFE7E6E6' }); cell(3, c, null, { fill: c === 4 ? 'FFBBE76C' : 'FFE7E6E6' }); });
+    S.forEach((s, j) => { cell(2, 5 + j, `${s.p}교시`, { bold: true, fill: 'FFC49DD6' }); cell(3, 5 + j, s.time || '감독', { size: 7, fill: 'FFC49DD6' }); });
+    m.teachers.forEach((t, i) => {
+      const r = 4 + i;
+      cell(r, 1, i + 1); cell(r, 2, t.name, { bold: true }); cell(r, 3, t.home || ''); cell(r, 4, t.home ? m.moveRoomOf(t.home) : '', { fill: 'FFF1FBE6' });
+      S.forEach((s, j) => codeCell(cell, r, 5 + j, supCell(m, s, t.name)));
+    });
+    // 오른쪽: 시험 시간표 · 복도 위치 · 안내
+    let r = 2;
+    ws.mergeCells(r, R0, r, lastCol); cell(r, R0, '시험 시간표', { bold: true, fill: 'FF334155', color: 'FFFFFFFF' }); r++;
+    cell(r, R0, '교시', { bold: true, fill: 'FFE7E6E6' }); cell(r, R0 + 1, '시간', { bold: true, fill: 'FFE7E6E6' }); m.present.forEach((g, k) => cell(r, R0 + 2 + k, `${g}학년`, { bold: true, fill: 'FFE7E6E6' })); r++;
+    S.forEach(s => {
+      cell(r, R0, `${s.p}교시`); cell(r, R0 + 1, s.time || '', { size: 8 });
+      m.present.forEach((g, k) => { const l = s.subs[g], cls = s.classG.includes(g); cell(r, R0 + 2 + k, cls ? '수업' : l.join('/') || '-', { size: 7, fill: !cls && l.some(x => !isSelf(x)) ? 'FFFFFF00' : undefined, align: { vertical: 'middle', horizontal: 'center', shrinkToFit: true } }); });
+      r++;
+    });
+    r++;
+    const posts = (m.sup.posts || []).filter(p => p.name);
+    if (posts.length) {
+      ws.mergeCells(r, R0, r, lastCol); cell(r, R0, '복도 감독 위치', { bold: true, fill: 'FFCDF2E4' }); r++;
+      posts.forEach(p => { cell(r, R0, null); ws.mergeCells(r, R0, r, R0 + 1); cell(r, R0, p.name, { bold: true }); ws.mergeCells(r, R0 + 2, r, lastCol); cell(r, R0 + 2, p.desc || '', { size: 8 }); r++; });
+      r++;
+    }
+    const noteLines = String(m.sup.note || '').split('\n').length + 3;
+    const nr = Math.max(noteLines + 2, 10);
+    ws.mergeCells(r, R0, r + nr - 1, lastCol);
+    cell(r, R0, `${m.sup.note || ''}\n\n<기호 표시>\n♣ 출제 교과 시험(고사본부 대기)\n(정) 정감독 · (부) 부감독 · 대기 = 교무실 대기`, { size: 8, align: { vertical: 'top', horizontal: 'left', wrapText: true } });
+    for (let k = 0; k < nr; k++) for (let c = R0; c <= lastCol; c++) ws.getCell(r + k, c).border = B;
+    const lastRow = Math.max(3 + m.teachers.length, r + nr);
+    for (let k = 2; k <= lastRow; k++) if (!ws.getRow(k).height) ws.getRow(k).height = 16.4;
+    [5.1, 8.8, 5.4, 5.4].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+    S.forEach((_, j) => { ws.getColumn(5 + j).width = 11.5; });
+    ws.getColumn(R0 - 1).width = 1.8; ws.getColumn(R0).width = 6; ws.getColumn(R0 + 1).width = 12.8;
+    m.present.forEach((_, k) => { ws.getColumn(R0 + 2 + k).width = 12; });
+  });
+  // 2) 일자별 반별 감독표
+  m.days.forEach(day => {
+    const S = day.slots;
+    const ws = wb.addWorksheet(sheetName(`${day.dot}_반별감독표`), page());
+    const cell = mk(ws);
+    const last = 2 + S.length * 2;
+    ws.mergeCells(1, 1, 1, last); cell(1, 1, `${examTitle} ${day.md} 반별 감독표`, { size: 16, bold: true, border: false }); ws.getRow(1).height = 30.75;
+    ws.mergeCells(2, 1, 3, 1); cell(2, 1, '학년', { bold: true, fill: 'FFE7E6E6' }); cell(3, 1, null, { fill: 'FFE7E6E6' });
+    ws.mergeCells(2, 2, 3, 2); cell(2, 2, '반', { bold: true, fill: 'FFE7E6E6' }); cell(3, 2, null, { fill: 'FFE7E6E6' });
+    S.forEach((s, j) => { const c = 3 + j * 2; ws.mergeCells(2, c, 2, c + 1); cell(2, c, `${s.p}교시 ${s.time || ''}`.trim(), { bold: true, fill: 'FFC49DD6' }); cell(2, c + 1, null, { fill: 'FFC49DD6' }); cell(3, c, '제1감독(정)', { bold: true, fill: 'FFE7E6E6' }); cell(3, c + 1, '제2감독(부)', { bold: true, fill: 'FFE7E6E6' }); });
+    const nameOf = (s, code) => m.teachers.filter(t => ((m.sup.assign || {})[s.key] || {})[t.name] === code).map(t => t.name).join(', ');
+    let r = 4;
+    m.present.forEach(g => {
+      const cs = m.classes[g] || []; if (!cs.length) return;
+      ws.mergeCells(r, 1, r + cs.length - 1, 1); cell(r, 1, `${g}학년`, { bold: true, fill: 'FFF8FAFC' });
+      cs.forEach((c, ci) => {
+        const room = clsKey(g, c); if (ci) cell(r, 1, null);
+        cell(r, 2, `${c}반`, { bold: true });
+        S.forEach((s, j) => {
+          const col = 3 + j * 2, rm = s.rooms.find(x => x.room === room);
+          if (!rm) { ws.mergeCells(r, col, r, col + 1); cell(r, col, s.classG.includes(g) ? '수업' : '-', { color: 'FF94A3B8', fill: s.classG.includes(g) ? 'FFF1F5F9' : undefined }); cell(r, col + 1, null); return; }
+          cell(r, col, nameOf(s, `R|${room}|정`)); cell(r, col + 1, rm.need > 1 ? nameOf(s, `R|${room}|부`) : '-', { color: rm.need > 1 ? undefined : 'FFBBBBBB' });
+        });
+        r++;
+      });
+    });
+    const posts = (m.sup.posts || []).filter(p => p.name);
+    posts.forEach(p => { ws.mergeCells(r, 1, r, 2); cell(r, 1, p.name, { bold: true, fill: 'FFCDF2E4' }); cell(r, 2, null, { fill: 'FFCDF2E4' }); S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, nameOf(s, `C|${p.name}`)); cell(r, col + 1, null); }); r++; });
+    if (+m.sup.standby) { ws.mergeCells(r, 1, r, 2); cell(r, 1, '대기', { bold: true }); cell(r, 2, null); S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, Array.from({ length: +m.sup.standby }, (_, k) => nameOf(s, `W|${k + 1}`)).filter(Boolean).join(', '), { color: 'FFE00000', bold: true }); cell(r, col + 1, null); }); r++; }
+    ws.mergeCells(r, 1, r, 2); cell(r, 1, '본부 ♣', { bold: true, fill: 'FF42C7F1' }); cell(r, 2, null, { fill: 'FF42C7F1' });
+    S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '), { size: 8 }); cell(r, col + 1, null); });
+    for (let k = 2; k <= r; k++) ws.getRow(k).height = 16.4;
+    ws.getColumn(1).width = 7; ws.getColumn(2).width = 9; S.forEach((_, j) => { ws.getColumn(3 + j * 2).width = 12; ws.getColumn(4 + j * 2).width = 12; });
+  });
+  // 3) 교사(전체) — 결재용 · 다음 시험 때 '이전 감독 횟수'로 불러올 수 있음
+  const ws = wb.addWorksheet('교사(전체)', page({ }));
+  ws.headerFooter = { oddHeader: `&C&"맑은 고딕,Bold"&12${examTitle} 감독 편성표 (교사별)`, oddFooter: '&C&8&P / &N' };
+  ws.__hwpTitle = `${examTitle} 감독 편성표 (교사별)`;
+  const cell = mk(ws), S = m.slots, nS = S.length, C0 = 2 + nS;
+  cell(1, 1, '요일', { bold: true, fill: 'FFE7E6E6' });
+  let c = 2; m.days.forEach(d => { if (d.slots.length > 1) ws.mergeCells(1, c, 1, c + d.slots.length - 1); cell(1, c, d.sh, { bold: true, fill: 'FFDCE6F1' }); for (let k = 1; k < d.slots.length; k++) cell(1, c + k, null, { fill: 'FFDCE6F1' }); c += d.slots.length; });
+  ['교실', '모고', '복도', '합계', '이전', '총계'].forEach((t, k) => { ws.mergeCells(1, C0 + k, 2, C0 + k); cell(1, C0 + k, t, { bold: true, fill: t === '총계' ? 'FFFFF2CC' : 'FFE7E6E6' }); cell(2, C0 + k, null, { fill: t === '총계' ? 'FFFFF2CC' : 'FFE7E6E6' }); });
+  cell(2, 1, '교사', { bold: true, fill: 'FFE7E6E6' });
+  S.forEach((s, j) => cell(2, 2 + j, `${s.p}교시\n(${GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join('/')})`, { size: 7, fill: 'FFC49DD6' }));
+  ws.getRow(1).height = 21.75; ws.getRow(2).height = 34;
+  m.teachers.forEach((t, i) => {
+    const r = 3 + i, k = counts[t.name];
+    cell(r, 1, t.name, { bold: true });
+    S.forEach((s, j) => { const x = supCell(m, s, t.name); codeCell(cell, r, 2 + j, { ...x, text: x.short || x.text }); });
+    [k.room, k.mock || '', k.cor || '', k.sum, k.prev || '', k.total].forEach((v, q) => cell(r, C0 + q, v, { bold: q === 5, fill: q === 5 ? 'FFFFF2CC' : undefined }));
+    ws.getRow(r).height = 21.75;
+  });
+  ws.getColumn(1).width = 8.2; S.forEach((_, j) => { ws.getColumn(2 + j).width = 8.4; }); for (let q = 0; q < 6; q++) ws.getColumn(C0 + q).width = 5.2;
+  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 2 }];
+  return wb;
+}
+
+/* ---- PDF (페이지 그림 → A4) · 필요할 때만 라이브러리를 불러온다 ---- */
+const loadScript = src => new Promise((res, rej) => {
+  if (document.querySelector(`script[src="${src}"]`)) { const t = setInterval(() => { if (document.querySelector(`script[src="${src}"]`).dataset.ok) { clearInterval(t); res(); } }, 50); return; }
+  const s = document.createElement('script'); s.src = src; s.onload = () => { s.dataset.ok = '1'; res(); }; s.onerror = () => rej(new Error(`라이브러리를 불러오지 못했습니다: ${src}`)); document.head.appendChild(s);
+});
+const LIB = {
+  h2c: 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+  jspdf: 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+  jszip: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+};
+async function pagesToPdf(pages, onProgress) {
+  await loadScript(LIB.h2c); await loadScript(LIB.jspdf);
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+  // 화면용 스타일(Tailwind)이 섞이지 않도록 인쇄용 스타일만 있는 별도 문서(iframe)에서 그린다
+  const host = document.createElement('iframe');
+  host.setAttribute('aria-hidden', 'true');
+  host.style.cssText = 'position:fixed;left:-30000px;top:0;width:1400px;height:2000px;border:0';
+  document.body.appendChild(host);
+  const doc = host.contentDocument;
+  doc.open(); doc.write(`<!doctype html><html lang="ko"><head><meta charset="utf-8"><style>${PRINT_CSS}html,body{margin:0;padding:0;background:#fff}</style></head><body><div id="pg" style="display:inline-block;background:#fff"></div></body></html>`); doc.close();
+  try {
+    if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+    for (let i = 0; i < pages.length; i++) {
+      if (onProgress) onProgress(i + 1, pages.length);
+      const el = doc.getElementById('pg');
+      el.innerHTML = pages[i];
+      await new Promise(r => setTimeout(r, 30));
+      const canvas = await window.html2canvas(el, { scale: 2, backgroundColor: '#ffffff', logging: false, windowWidth: 1400, foreignObjectRendering: true });
+      const wmm = canvas.width / 2 / MM, hmm = canvas.height / 2 / MM;
+      const z = Math.min(190 / wmm, 277 / hmm, 1), w = wmm * z, h = hmm * z;
+      if (i) pdf.addPage('a4', 'portrait');
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.85), 'JPEG', (210 - w) / 2, 10, w, h);
+    }
+  } finally { host.remove(); }
+  return pdf.output('blob');
+}
+/* ---- 한글(HWPX): 엑셀 시트의 격자(병합·열 너비·행 높이·글꼴·채우기·테두리)를 그대로 한글 표로 옮긴다 ----
+ * 문서 머리 정의는 python-hwpx(Apache-2.0)의 빈 문서 틀(Skeleton.hwpx)을 바탕으로, 필요한 글자·문단·테두리 모양을 덧붙인다. */
+const HWPX_HEADER = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?><hh:head xmlns:ha=\"http://www.hancom.co.kr/hwpml/2011/app\" xmlns:hp=\"http://www.hancom.co.kr/hwpml/2011/paragraph\" xmlns:hp10=\"http://www.hancom.co.kr/hwpml/2016/paragraph\" xmlns:hs=\"http://www.hancom.co.kr/hwpml/2011/section\" xmlns:hc=\"http://www.hancom.co.kr/hwpml/2011/core\" xmlns:hh=\"http://www.hancom.co.kr/hwpml/2011/head\" xmlns:hhs=\"http://www.hancom.co.kr/hwpml/2011/history\" xmlns:hm=\"http://www.hancom.co.kr/hwpml/2011/master-page\" xmlns:hpf=\"http://www.hancom.co.kr/schema/2011/hpf\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:opf=\"http://www.idpf.org/2007/opf/\" xmlns:ooxmlchart=\"http://www.hancom.co.kr/hwpml/2016/ooxmlchart\" xmlns:hwpunitchar=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\" xmlns:epub=\"http://www.idpf.org/2007/ops\" xmlns:config=\"urn:oasis:names:tc:opendocument:xmlns:config:1.0\" version=\"1.5\" secCnt=\"1\"><hh:beginNum page=\"1\" footnote=\"1\" endnote=\"1\" pic=\"1\" tbl=\"1\" equation=\"1\"/><hh:refList><hh:fontfaces itemCnt=\"7\"><hh:fontface lang=\"HANGUL\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><hh:fontface lang=\"LATIN\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><hh:fontface lang=\"HANJA\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><hh:fontface lang=\"JAPANESE\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><hh:fontface lang=\"OTHER\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><hh:fontface lang=\"SYMBOL\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><hh:fontface lang=\"USER\" fontCnt=\"2\"><hh:font id=\"0\" face=\"함초롬돋움\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><hh:font id=\"1\" face=\"함초롬바탕\" type=\"TTF\" isEmbedded=\"0\"><hh:typeInfo familyType=\"FCAT_GOTHIC\" weight=\"6\" proportion=\"4\" contrast=\"0\" strokeVariation=\"1\" armStyle=\"1\" letterform=\"1\" midline=\"1\" xHeight=\"1\"/><\/hh:font><\/hh:fontface><\/hh:fontfaces><hh:borderFills itemCnt=\"2\"><hh:borderFill id=\"1\" threeD=\"0\" shadow=\"0\" centerLine=\"NONE\" breakCellSeparateLine=\"0\"><hh:slash type=\"NONE\" Crooked=\"0\" isCounter=\"0\"/><hh:backSlash type=\"NONE\" Crooked=\"0\" isCounter=\"0\"/><hh:leftBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:rightBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:topBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:bottomBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:diagonal type=\"SOLID\" width=\"0.1 mm\" color=\"#000000\"/><\/hh:borderFill><hh:borderFill id=\"2\" threeD=\"0\" shadow=\"0\" centerLine=\"NONE\" breakCellSeparateLine=\"0\"><hh:slash type=\"NONE\" Crooked=\"0\" isCounter=\"0\"/><hh:backSlash type=\"NONE\" Crooked=\"0\" isCounter=\"0\"/><hh:leftBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:rightBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:topBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:bottomBorder type=\"NONE\" width=\"0.1 mm\" color=\"#000000\"/><hh:diagonal type=\"SOLID\" width=\"0.1 mm\" color=\"#000000\"/><hc:fillBrush><hc:winBrush faceColor=\"none\" hatchColor=\"#999999\" alpha=\"0\"/><\/hc:fillBrush><\/hh:borderFill><\/hh:borderFills><hh:charProperties itemCnt=\"7\"><hh:charPr id=\"0\" height=\"1000\" textColor=\"#000000\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"1\" latin=\"1\" hanja=\"1\" japanese=\"1\" other=\"1\" symbol=\"1\" user=\"1\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><hh:charPr id=\"1\" height=\"1000\" textColor=\"#000000\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><hh:charPr id=\"2\" height=\"900\" textColor=\"#000000\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><hh:charPr id=\"3\" height=\"900\" textColor=\"#000000\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"1\" latin=\"1\" hanja=\"1\" japanese=\"1\" other=\"1\" symbol=\"1\" user=\"1\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><hh:charPr id=\"4\" height=\"900\" textColor=\"#000000\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"-5\" latin=\"-5\" hanja=\"-5\" japanese=\"-5\" other=\"-5\" symbol=\"-5\" user=\"-5\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><hh:charPr id=\"5\" height=\"1600\" textColor=\"#2E74B5\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><hh:charPr id=\"6\" height=\"1100\" textColor=\"#000000\" shadeColor=\"none\" useFontSpace=\"0\" useKerning=\"0\" symMark=\"NONE\" borderFillIDRef=\"2\"><hh:fontRef hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:ratio hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:spacing hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:relSz hangul=\"100\" latin=\"100\" hanja=\"100\" japanese=\"100\" other=\"100\" symbol=\"100\" user=\"100\"/><hh:offset hangul=\"0\" latin=\"0\" hanja=\"0\" japanese=\"0\" other=\"0\" symbol=\"0\" user=\"0\"/><hh:underline type=\"NONE\" shape=\"SOLID\" color=\"#000000\"/><hh:strikeout shape=\"NONE\" color=\"#000000\"/><hh:outline type=\"NONE\"/><hh:shadow type=\"NONE\" color=\"#C0C0C0\" offsetX=\"10\" offsetY=\"10\"/><\/hh:charPr><\/hh:charProperties><hh:tabProperties itemCnt=\"3\"><hh:tabPr id=\"0\" autoTabLeft=\"0\" autoTabRight=\"0\"/><hh:tabPr id=\"1\" autoTabLeft=\"1\" autoTabRight=\"0\"/><hh:tabPr id=\"2\" autoTabLeft=\"0\" autoTabRight=\"1\"/><\/hh:tabProperties><hh:numberings itemCnt=\"1\"><hh:numbering id=\"1\" start=\"0\"><hh:paraHead start=\"1\" level=\"1\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"DIGIT\" charPrIDRef=\"4294967295\" checkable=\"0\">^1.<\/hh:paraHead><hh:paraHead start=\"1\" level=\"2\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"HANGUL_SYLLABLE\" charPrIDRef=\"4294967295\" checkable=\"0\">^2.<\/hh:paraHead><hh:paraHead start=\"1\" level=\"3\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"DIGIT\" charPrIDRef=\"4294967295\" checkable=\"0\">^3)<\/hh:paraHead><hh:paraHead start=\"1\" level=\"4\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"HANGUL_SYLLABLE\" charPrIDRef=\"4294967295\" checkable=\"0\">^4)<\/hh:paraHead><hh:paraHead start=\"1\" level=\"5\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"DIGIT\" charPrIDRef=\"4294967295\" checkable=\"0\">(^5)<\/hh:paraHead><hh:paraHead start=\"1\" level=\"6\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"HANGUL_SYLLABLE\" charPrIDRef=\"4294967295\" checkable=\"0\">(^6)<\/hh:paraHead><hh:paraHead start=\"1\" level=\"7\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"CIRCLED_DIGIT\" charPrIDRef=\"4294967295\" checkable=\"1\">^7<\/hh:paraHead><hh:paraHead start=\"1\" level=\"8\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"CIRCLED_HANGUL_SYLLABLE\" charPrIDRef=\"4294967295\" checkable=\"1\">^8<\/hh:paraHead><hh:paraHead start=\"1\" level=\"9\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"HANGUL_JAMO\" charPrIDRef=\"4294967295\" checkable=\"0\"/><hh:paraHead start=\"1\" level=\"10\" align=\"LEFT\" useInstWidth=\"1\" autoIndent=\"1\" widthAdjust=\"0\" textOffsetType=\"PERCENT\" textOffset=\"50\" numFormat=\"ROMAN_SMALL\" charPrIDRef=\"4294967295\" checkable=\"1\"/><\/hh:numbering><\/hh:numberings><hh:paraProperties itemCnt=\"20\"><hh:paraPr id=\"0\" tabPrIDRef=\"0\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"1\" tabPrIDRef=\"0\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"1500\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"3000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"2\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"1000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"2000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"3\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"1\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"2000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"4000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"4\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"2\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"3000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"6000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"5\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"3\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"4000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"8000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"6\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"4\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"5000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"10000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"7\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"5\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"6000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"12000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"8\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"6\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"7000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"14000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"9\" tabPrIDRef=\"0\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"150\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"150\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"10\" tabPrIDRef=\"0\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"-1310\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"130\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"-2620\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"130\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"11\" tabPrIDRef=\"0\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"LEFT\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"130\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"130\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"12\" tabPrIDRef=\"1\" condense=\"20\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"LEFT\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"1200\" unit=\"HWPUNIT\"/><hc:next value=\"300\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"2400\" unit=\"HWPUNIT\"/><hc:next value=\"600\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"13\" tabPrIDRef=\"2\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"LEFT\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"700\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"1400\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"14\" tabPrIDRef=\"2\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"LEFT\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"1100\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"700\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"2200\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"1400\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"15\" tabPrIDRef=\"2\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"LEFT\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"BREAK_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"2200\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"700\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"4400\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"1400\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"16\" tabPrIDRef=\"1\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/paragraph\"><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"8\"/><\/hp:case><hp:default><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><\/hp:default><\/hp:switch><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"9000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"18000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"17\" tabPrIDRef=\"1\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/paragraph\"><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"9\"/><\/hp:case><hp:default><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><\/hp:default><\/hp:switch><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"10000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"20000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"18\" tabPrIDRef=\"1\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/paragraph\"><hh:heading type=\"OUTLINE\" idRef=\"0\" level=\"7\"/><\/hp:case><hp:default><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><\/hp:default><\/hp:switch><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"8000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"16000\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"0\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"160\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><hh:paraPr id=\"19\" tabPrIDRef=\"0\" condense=\"0\" fontLineHeight=\"0\" snapToGrid=\"1\" suppressLineNumbers=\"0\" checked=\"0\" textDir=\"LTR\"><hh:align horizontal=\"JUSTIFY\" vertical=\"BASELINE\"/><hh:heading type=\"NONE\" idRef=\"0\" level=\"0\"/><hh:breakSetting breakLatinWord=\"KEEP_WORD\" breakNonLatinWord=\"KEEP_WORD\" widowOrphan=\"0\" keepWithNext=\"0\" keepLines=\"0\" pageBreakBefore=\"0\" lineWrap=\"BREAK\"/><hh:autoSpacing eAsianEng=\"0\" eAsianNum=\"0\"/><hp:switch><hp:case hp:required-namespace=\"http://www.hancom.co.kr/hwpml/2016/HwpUnitChar\"><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"800\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"150\" unit=\"HWPUNIT\"/><\/hp:case><hp:default><hh:margin><hc:intent value=\"0\" unit=\"HWPUNIT\"/><hc:left value=\"0\" unit=\"HWPUNIT\"/><hc:right value=\"0\" unit=\"HWPUNIT\"/><hc:prev value=\"0\" unit=\"HWPUNIT\"/><hc:next value=\"1600\" unit=\"HWPUNIT\"/><\/hh:margin><hh:lineSpacing type=\"PERCENT\" value=\"150\" unit=\"HWPUNIT\"/><\/hp:default><\/hp:switch><hh:border borderFillIDRef=\"2\" offsetLeft=\"0\" offsetRight=\"0\" offsetTop=\"0\" offsetBottom=\"0\" connect=\"0\" ignoreMargin=\"0\"/><\/hh:paraPr><\/hh:paraProperties><hh:styles itemCnt=\"23\"><hh:style id=\"0\" type=\"PARA\" name=\"바탕글\" engName=\"Normal\" paraPrIDRef=\"0\" charPrIDRef=\"0\" nextStyleIDRef=\"0\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"1\" type=\"PARA\" name=\"본문\" engName=\"Body\" paraPrIDRef=\"1\" charPrIDRef=\"0\" nextStyleIDRef=\"1\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"2\" type=\"PARA\" name=\"개요 1\" engName=\"Outline 1\" paraPrIDRef=\"2\" charPrIDRef=\"0\" nextStyleIDRef=\"2\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"3\" type=\"PARA\" name=\"개요 2\" engName=\"Outline 2\" paraPrIDRef=\"3\" charPrIDRef=\"0\" nextStyleIDRef=\"3\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"4\" type=\"PARA\" name=\"개요 3\" engName=\"Outline 3\" paraPrIDRef=\"4\" charPrIDRef=\"0\" nextStyleIDRef=\"4\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"5\" type=\"PARA\" name=\"개요 4\" engName=\"Outline 4\" paraPrIDRef=\"5\" charPrIDRef=\"0\" nextStyleIDRef=\"5\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"6\" type=\"PARA\" name=\"개요 5\" engName=\"Outline 5\" paraPrIDRef=\"6\" charPrIDRef=\"0\" nextStyleIDRef=\"6\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"7\" type=\"PARA\" name=\"개요 6\" engName=\"Outline 6\" paraPrIDRef=\"7\" charPrIDRef=\"0\" nextStyleIDRef=\"7\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"8\" type=\"PARA\" name=\"개요 7\" engName=\"Outline 7\" paraPrIDRef=\"8\" charPrIDRef=\"0\" nextStyleIDRef=\"8\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"9\" type=\"PARA\" name=\"개요 8\" engName=\"Outline 8\" paraPrIDRef=\"18\" charPrIDRef=\"0\" nextStyleIDRef=\"9\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"10\" type=\"PARA\" name=\"개요 9\" engName=\"Outline 9\" paraPrIDRef=\"16\" charPrIDRef=\"0\" nextStyleIDRef=\"10\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"11\" type=\"PARA\" name=\"개요 10\" engName=\"Outline 10\" paraPrIDRef=\"17\" charPrIDRef=\"0\" nextStyleIDRef=\"11\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"12\" type=\"CHAR\" name=\"쪽 번호\" engName=\"Page Number\" paraPrIDRef=\"0\" charPrIDRef=\"1\" nextStyleIDRef=\"0\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"13\" type=\"CHAR\" name=\"줄 번호\" engName=\"Line Number\" paraPrIDRef=\"0\" charPrIDRef=\"0\" nextStyleIDRef=\"0\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"14\" type=\"PARA\" name=\"머리말\" engName=\"Header\" paraPrIDRef=\"9\" charPrIDRef=\"2\" nextStyleIDRef=\"14\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"15\" type=\"PARA\" name=\"각주\" engName=\"Footnote\" paraPrIDRef=\"10\" charPrIDRef=\"3\" nextStyleIDRef=\"15\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"16\" type=\"PARA\" name=\"미주\" engName=\"Endnote\" paraPrIDRef=\"10\" charPrIDRef=\"3\" nextStyleIDRef=\"16\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"17\" type=\"PARA\" name=\"메모\" engName=\"Memo\" paraPrIDRef=\"11\" charPrIDRef=\"4\" nextStyleIDRef=\"17\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"18\" type=\"PARA\" name=\"차례 제목\" engName=\"TOC Heading\" paraPrIDRef=\"12\" charPrIDRef=\"5\" nextStyleIDRef=\"18\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"19\" type=\"PARA\" name=\"차례 1\" engName=\"TOC 1\" paraPrIDRef=\"13\" charPrIDRef=\"6\" nextStyleIDRef=\"19\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"20\" type=\"PARA\" name=\"차례 2\" engName=\"TOC 2\" paraPrIDRef=\"14\" charPrIDRef=\"6\" nextStyleIDRef=\"20\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"21\" type=\"PARA\" name=\"차례 3\" engName=\"TOC 3\" paraPrIDRef=\"15\" charPrIDRef=\"6\" nextStyleIDRef=\"21\" langID=\"1042\" lockForm=\"0\"/><hh:style id=\"22\" type=\"PARA\" name=\"캡션\" engName=\"Caption\" paraPrIDRef=\"19\" charPrIDRef=\"0\" nextStyleIDRef=\"22\" langID=\"1042\" lockForm=\"0\"/><\/hh:styles><\/hh:refList><hh:compatibleDocument targetProgram=\"HWP201X\"><hh:layoutCompatibility/><\/hh:compatibleDocument><hh:docOption><hh:linkinfo path=\"\" pageInherit=\"0\" footnoteInherit=\"0\"/><\/hh:docOption><hh:metaTag>{\"name\":\"\"}<\/hh:metaTag><hh:trackchageConfig flags=\"56\"/><\/hh:head>";
+const HWPX_NS = 'xmlns:ha="http://www.hancom.co.kr/hwpml/2011/app" xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" xmlns:hp10="http://www.hancom.co.kr/hwpml/2016/paragraph" xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" xmlns:hhs="http://www.hancom.co.kr/hwpml/2011/history" xmlns:hm="http://www.hancom.co.kr/hwpml/2011/master-page" xmlns:hpf="http://www.hancom.co.kr/schema/2011/hpf" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf/" xmlns:ooxmlchart="http://www.hancom.co.kr/hwpml/2016/ooxmlchart" xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar" xmlns:epub="http://www.idpf.org/2007/ops" xmlns:config="urn:oasis:names:tc:opendocument:xmlns:config:1.0"';
+const xesc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function hwpxStyles() {
+  const head = HWPX_HEADER;
+  const grab = (tag, id) => { const i = head.indexOf(`<hh:${tag} id="${id}"`); return head.slice(i, head.indexOf(`</hh:${tag}>`, i) + tag.length + 6); };
+  const count = tag => +(head.match(new RegExp(`<hh:${tag} itemCnt="(\\d+)"`)) || [0, 0])[1];
+  const charTpl = grab('charPr', 1), paraTpl = grab('paraPr', 0);
+  const st = { bf: [], cp: [], pp: [], bfId: {}, cpId: {}, ppId: {}, nbf: count('borderFills'), ncp: count('charProperties'), npp: count('paraProperties') };
+  st.border = (line, fill) => {
+    const k = `${line ? 1 : 0}|${fill || ''}`; if (k in st.bfId) return st.bfId[k];
+    const id = st.nbf + st.bf.length + 1, b = line ? 'SOLID' : 'NONE', w = line ? '0.12 mm' : '0.1 mm';
+    st.bf.push(`<hh:borderFill id="${id}" threeD="0" shadow="0" centerLine="NONE" breakCellSeparateLine="0"><hh:slash type="NONE" Crooked="0" isCounter="0"/><hh:backSlash type="NONE" Crooked="0" isCounter="0"/>`
+      + ['left', 'right', 'top', 'bottom'].map(s => `<hh:${s}Border type="${b}" width="${w}" color="#000000"/>`).join('') + '<hh:diagonal type="SOLID" width="0.1 mm" color="#000000"/>'
+      + (fill ? `<hc:fillBrush><hc:winBrush faceColor="${fill}" hatchColor="#999999" alpha="0"/></hc:fillBrush>` : '') + '</hh:borderFill>');
+    return (st.bfId[k] = id);
+  };
+  st.char = (pt, bold, color) => {
+    const h = Math.max(500, Math.round(pt * 10) * 10), k = `${h}|${bold ? 1 : 0}|${color || '#000000'}`; if (k in st.cpId) return st.cpId[k];
+    const id = st.ncp + st.cp.length;
+    let x = charTpl.replace(/id="1"/, `id="${id}"`).replace(/height="\d+"/, `height="${h}"`).replace(/textColor="[^"]*"/, `textColor="${color || '#000000'}"`);
+    if (bold) x = x.replace('<hh:underline', '<hh:bold/><hh:underline');
+    st.cp.push(x); return (st.cpId[k] = id);
+  };
+  st.para = (align, spacing = 120) => {
+    const k = `${align}|${spacing}`; if (k in st.ppId) return st.ppId[k];
+    const id = st.npp + st.pp.length;
+    st.pp.push(paraTpl.replace(/id="0"/, `id="${id}"`).replace('horizontal="JUSTIFY"', `horizontal="${align}"`).replace(/lineSpacing type="PERCENT" value="160"/g, `lineSpacing type="PERCENT" value="${spacing}"`).replace('snapToGrid="1"', 'snapToGrid="0"'));
+    return (st.ppId[k] = id);
+  };
+  st.header = () => {
+    const add = (h, tag, list, n) => list.length ? h.replace(new RegExp(`<hh:${tag} itemCnt="\\d+">`), `<hh:${tag} itemCnt="${n + list.length}">`).replace(`</hh:${tag}>`, list.join('') + `</hh:${tag}>`) : h;
+    let h = add(head, 'borderFills', st.bf, st.nbf); h = add(h, 'charProperties', st.cp, st.ncp); h = add(h, 'paraProperties', st.pp, st.npp);
+    return h;
+  };
+  return st;
+}
+// 엑셀 시트 → 한글 표 (A4 세로, 여백 10mm, 본문 폭에 맞춰 열 너비 조정 · 넘치면 행 높이·글씨를 조금 줄이고 그래도 넘치면 머리행 반복하며 다음 쪽으로)
+function hwpxTable(ws, st, ids, opt) {
+  const merges = (ws.model.merges || []).map(a => { const [p, q] = a.split(':'); const d = x => { const m = x.match(/^([A-Z]+)(\d+)$/); let c = 0; for (const ch of m[1]) c = c * 26 + ch.charCodeAt(0) - 64; return [+m[2], c]; }; const [r1, c1] = d(p), [r2, c2] = d(q || p); return { r1, c1, r2, c2 }; });
+  const R0 = opt.skipRows || 0, nR = ws.rowCount, nC = ws.columnCount;
+  const cover = {}, span = {};
+  merges.forEach(g => { if (g.r1 <= R0) return; span[`${g.r1}-${g.c1}`] = g; for (let r = g.r1; r <= g.r2; r++) for (let c = g.c1; c <= g.c2; c++) if (r !== g.r1 || c !== g.c1) cover[`${r}-${c}`] = 1; });
+  const colPx = Array.from({ length: nC }, (_, i) => Math.trunc((ws.getColumn(i + 1).width || 9) * 7 + 5));
+  const W = opt.width, sumPx = colPx.reduce((a, b) => a + b, 0);
+  const colW = colPx.map(p => Math.floor(W * p / sumPx));
+  const rows = []; for (let r = R0 + 1; r <= nR; r++) rows.push(r);
+  const rowPt = r => ws.getRow(r).height || 15;
+  const totalH = rows.reduce((a, r) => a + rowPt(r) * 100, 0);
+  const s = Math.max(0.62, Math.min(1, opt.height / totalH)), fs = Math.max(0.78, Math.min(1, s + 0.1));
+  const rowH = r => Math.round(rowPt(r) * 100 * s);
+  const hex = argb => (argb && /^[0-9A-F]{8}$/i.test(argb) ? `#${argb.slice(2)}` : null);
+  const trs = rows.map((r, ri) => {
+    const tcs = [];
+    for (let c = 1; c <= nC; c++) {
+      if (cover[`${r}-${c}`]) continue;
+      const g = span[`${r}-${c}`], cs = g ? g.c2 - g.c1 + 1 : 1, rs = g ? g.r2 - g.r1 + 1 : 1;
+      const x = ws.getCell(r, c), f = x.font || {}, al = x.alignment || {};
+      const fill = x.fill && x.fill.fgColor ? hex(x.fill.fgColor.argb) : null;
+      const line = !!(x.border && x.border.top);
+      const v = x.value == null ? '' : typeof x.value === 'object' ? (x.value.richText ? x.value.richText.map(t => t.text).join('') : String(x.value.result ?? '')) : String(x.value);
+      const cpId = st.char((f.size || 9) * fs, f.bold, hex(f.color && f.color.argb));
+      const ppId = st.para(al.horizontal === 'left' ? 'LEFT' : al.horizontal === 'right' ? 'RIGHT' : 'CENTER', al.vertical === 'top' ? 135 : 110);
+      const w = colW.slice(c - 1, c - 1 + cs).reduce((a, b) => a + b, 0);
+      let h = 0; for (let k = 0; k < rs; k++) h += rowH(r + k);
+      const paras = v.split('\n').map(t => `<hp:p id="${ids.p++}" paraPrIDRef="${ppId}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="${cpId}">${t ? `<hp:t>${xesc(t)}</hp:t>` : '<hp:t/>'}</hp:run></hp:p>`).join('');
+      tcs.push(`<hp:tc name="" header="${ri < (opt.headRows || 0) ? 1 : 0}" hasMargin="1" protect="0" editable="0" dirty="0" borderFillIDRef="${st.border(line, fill)}"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="${al.vertical === 'top' ? 'TOP' : 'CENTER'}" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">${paras}</hp:subList>`
+        + `<hp:cellAddr colAddr="${c - 1}" rowAddr="${ri}"/><hp:cellSpan colSpan="${cs}" rowSpan="${rs}"/><hp:cellSz width="${w}" height="${h}"/><hp:cellMargin left="113" right="113" top="28" bottom="28"/></hp:tc>`);
+    }
+    return `<hp:tr>${tcs.join('')}</hp:tr>`;
+  });
+  const tw = colW.reduce((a, b) => a + b, 0), th = rows.reduce((a, r) => a + rowH(r), 0);
+  return `<hp:tbl id="${ids.t++}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="${opt.headRows ? 1 : 0}" rowCnt="${rows.length}" colCnt="${nC}" cellSpacing="0" borderFillIDRef="${st.border(false, null)}" noAdjust="0">`
+    + `<hp:sz width="${tw}" widthRelTo="ABSOLUTE" height="${th}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
+    + `<hp:outMargin left="0" right="0" top="0" bottom="0"/><hp:inMargin left="113" right="113" top="28" bottom="28"/>${trs.join('')}</hp:tbl>`;
+}
+async function buildSupHwpx(m, examTitle, counts) {
+  if (HWPX_HEADER.length < 1000) throw new Error('한글 문서 틀이 없습니다.');
+  await loadScript(LIB.jszip);
+  const wb = buildSupWorkbook(m, examTitle, counts);
+  const st = hwpxStyles(), ids = { p: 1, t: 1000 };
+  const PW = 59528, PH = 84186, MG = 2835; // A4, 여백 10mm (1mm ≈ 283.5)
+  const BW = PW - MG * 2, BH = PH - MG * 2 - 600;
+  const secPr = `<hp:secPr id="" textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" tabStopVal="4000" tabStopUnit="HWPUNIT" outlineShapeIDRef="1" memoShapeIDRef="0" textVerticalWidthHead="0" masterPageCnt="0"><hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/><hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/><hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/><hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/><hp:pagePr landscape="WIDELY" width="${PW}" height="${PH}" gutterType="LEFT_ONLY"><hp:margin header="0" footer="0" gutter="0" left="${MG}" right="${MG}" top="${MG}" bottom="${MG}"/></hp:pagePr><hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr><hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr><hp:pageBorderFill type="BOTH" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill><hp:pageBorderFill type="EVEN" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill><hp:pageBorderFill type="ODD" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill></hp:secPr><hp:ctrl><hp:colPr id="" type="NEWSPAPER" layout="LEFT" colCount="1" sameSz="1" sameGap="0"/></hp:ctrl>`;
+  const paras = [];
+  wb.worksheets.forEach((ws, i) => {
+    const title = ws.getCell(1, 1).value && ws.getCell(1, 1).font && ws.getCell(1, 1).font.size >= 14 ? String(ws.getCell(1, 1).value) : (ws.__hwpTitle || '');
+    const skip = title && !ws.__hwpTitle ? 1 : 0;
+    const cp = st.char(15, true), pp = st.para('CENTER', 130);
+    paras.push(`<hp:p id="${ids.p++}" paraPrIDRef="${pp}" styleIDRef="0" pageBreak="${i ? 1 : 0}" columnBreak="0" merged="0"><hp:run charPrIDRef="${cp}">${i === 0 ? secPr : ''}</hp:run><hp:run charPrIDRef="${cp}"><hp:t>${xesc(title)}</hp:t></hp:run></hp:p>`);
+    const headRows = 2;
+    paras.push(`<hp:p id="${ids.p++}" paraPrIDRef="${st.para('CENTER', 100)}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="${st.char(9)}">${hwpxTable(ws, st, ids, { skipRows: skip, width: BW, height: BH - 1500, headRows })}<hp:t/></hp:run></hp:p>`);
+  });
+  const section = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hs:sec ${HWPX_NS}>${paras.join('')}</hs:sec>`;
+  const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+  const hpf = `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><opf:package ${HWPX_NS} version="" unique-identifier="" id=""><opf:metadata><opf:title>${xesc(examTitle)} 감독표</opf:title><opf:language>ko</opf:language><opf:meta name="creator" content="text">정기고사 부착물 시스템</opf:meta><opf:meta name="subject" content="text"/><opf:meta name="description" content="text"/><opf:meta name="lastsaveby" content="text">정기고사 부착물 시스템</opf:meta><opf:meta name="CreatedDate" content="text">${now}</opf:meta><opf:meta name="ModifiedDate" content="text">${now}</opf:meta><opf:meta name="date" content="text"/><opf:meta name="keyword" content="text"/></opf:metadata><opf:manifest><opf:item id="header" href="Contents/header.xml" media-type="application/xml"/><opf:item id="section0" href="Contents/section0.xml" media-type="application/xml"/><opf:item id="settings" href="settings.xml" media-type="application/xml"/></opf:manifest><opf:spine><opf:itemref idref="header" linear="yes"/><opf:itemref idref="section0" linear="yes"/></opf:spine></opf:package>`;
+  const X = '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>';
+  const zip = new window.JSZip();
+  zip.file('mimetype', 'application/hwp+zip', { compression: 'STORE' });
+  zip.file('version.xml', `${X}<hv:HCFVersion xmlns:hv="http://www.hancom.co.kr/hwpml/2011/version" tagetApplication="WORDPROCESSOR" major="5" minor="1" micro="1" buildNumber="0" os="1" xmlVersion="1.5" application="Hancom Office Hangul" appVersion="13, 0, 0, 1408 WIN32LEWindows_10"/>`);
+  zip.file('Contents/header.xml', st.header());
+  zip.file('Contents/section0.xml', section);
+  zip.file('Contents/content.hpf', hpf);
+  zip.file('settings.xml', `${X}<ha:HWPApplicationSetting xmlns:ha="http://www.hancom.co.kr/hwpml/2011/app" xmlns:config="urn:oasis:names:tc:opendocument:xmlns:config:1.0"><ha:CaretPosition listIDRef="0" paraIDRef="0" pos="0"/></ha:HWPApplicationSetting>`);
+  zip.file('Preview/PrvText.txt', `${examTitle} 감독표\r\n${m.days.map(d => d.md).join(', ')}`);
+  zip.file('META-INF/container.xml', `${X}<ocf:container xmlns:ocf="urn:oasis:names:tc:opendocument:xmlns:container" xmlns:hpf="http://www.hancom.co.kr/schema/2011/hpf"><ocf:rootfiles><ocf:rootfile full-path="Contents/content.hpf" media-type="application/hwpml-package+xml"/><ocf:rootfile full-path="Preview/PrvText.txt" media-type="text/plain"/></ocf:rootfiles></ocf:container>`);
+  zip.file('META-INF/manifest.xml', `${X}<odf:manifest xmlns:odf="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"/>`);
+  return zip.generateAsync({ type: 'blob', mimeType: 'application/hwp+zip', compression: 'DEFLATE' });
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
 /* ------------------------------ 웹 인쇄 ------------------------------ */
 const PRINT_CSS = `
 table{font-size:inherit}
 ${ABS_CSS}
 ${STATS_CSS}
+${SUP_CSS}
 .b4{width:364mm;height:256.5mm;box-sizing:border-box;padding:5.1mm 3.8mm;background:#fff;color:#000;font-family:'Malgun Gothic','맑은 고딕','Noto Sans KR',sans-serif;overflow:hidden}
 .b4title{display:flex;align-items:center;justify-content:center;font-weight:900;line-height:1}
 .cb{width:100%;border-collapse:collapse;table-layout:fixed}
@@ -1102,6 +1730,15 @@ function App() {
   const [savedAt, setSavedAt] = useState('');
   const [shareOpen, setShareOpen] = useState(false);
   const [cfgOpen, setCfgOpen] = useState(false);
+  // 공동 작업
+  const syncRef = useRef(loadSync());
+  const connectedRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const suppressRef = useRef(0);
+  const autoTimer = useRef(null);
+  const syncBusy = useRef(false);
+  const [sync, setSync] = useState({ status: syncRef.current.url && syncRef.current.pw ? 'connecting' : syncRef.current.url && syncRef.current.name ? 'needpw' : 'off', remote: null, note: '', connected: false });
+  const [syncOpen, setSyncOpen] = useState(false);
   // 화면 상태
   const [tab, setTab] = useState(VIEWER ? 'chalkboard' : 'timetable');
   const [selGrade, setSelGrade] = useState(1);
@@ -1117,6 +1754,8 @@ function App() {
   const [times, setTimesState] = useState({ ...DEFAULT_TIMES });
   const [editors, setEditors] = useState({});
   const [roomOv, setRoomOv] = useState({});
+  const [sup, setSup] = useState(defaultSup); // 감독 시간표 (관리자)
+  const [resetOpen, setResetOpen] = useState(false);
   const examTitle = examTitleOf(exam);
 
   const say = (text, type = 'success') => setMsg({ text, type });
@@ -1179,20 +1818,136 @@ function App() {
     setTimesState({ ...DEFAULT_TIMES, ...(cfg.times || {}) });
     setEditors(cfg.editors || {});
     setRoomOv(cfg.roomOv || {});
+    setSup({ ...defaultSup(), ...(cfg.sup || {}) });
     const hasRoster = Array.isArray(cfg.sources) && cfg.sources.length > 0;
     applySources(hasRoster ? cfg.sources : sampleSources(), hasRoster ? cfg.label : '샘플 데이터 (1~3학년, 9개 학급)', kw, cfg.sel || {});
     setSavedAt(cfg.savedAt || '');
     return hasRoster;
   };
+  // ---------- 공동 작업 함수 ----------
+  const persistSync = patch => { syncRef.current = { ...syncRef.current, ...patch }; storeSync(syncRef.current); };
+  const setSyncState = (status, extra = {}) => setSync(x => ({ ...x, status, ...extra }));
+  const cloudCall = body => syncCall(syncRef.current.url, { auth: syncAuth(syncRef.current.pw), ...body });
+  const applyRemote = async (res, note) => {
+    const cfg = await decryptJSON(JSON.parse(res.data), syncRef.current.pw);
+    suppressRef.current = Date.now() + 2500;
+    clearTimeout(autoTimer.current);
+    applyConfig(cfg); safeStorage.set(CONFIG_KEY, JSON.stringify(cfg));
+    dirtyRef.current = false; persistSync({ syncedVersion: res.version, localDirty: false });
+    setSyncState('ok', { remote: res, note: '' });
+    say(note || `☁ 공동 작업 최신본(v${res.version} · ${res.savedBy || '-'} · ${res.savedAt})을 불러왔습니다.`, 'info');
+  };
+  const cloudLoad = async fileId => {
+    const res = await cloudCall({ action: 'load', fileId });
+    if (!res.ok) throw new Error(syncErrText(res.error));
+    return res.empty ? null : res;
+  };
+  const cloudSave = async (force = false, silent = false) => {
+    if (!connectedRef.current || syncBusy.current) return false;
+    syncBusy.current = true; clearTimeout(autoTimer.current); setSyncState('saving');
+    try {
+      const at = new Date().toLocaleString('ko-KR');
+      const cfg = buildRef.current(at);
+      const enc = await encryptJSON(cfg, syncRef.current.pw);
+      const res = await cloudCall({ action: 'save', baseVersion: syncRef.current.syncedVersion, force, data: JSON.stringify(enc), savedBy: syncRef.current.name || '이름 없음' });
+      if (!res.ok && res.error === 'CONFLICT') {
+        setSyncState('conflict', { remote: res });
+        if (!silent) say(`⚠ ${res.savedBy || '다른 분'}님이 ${res.savedAt}에 먼저 저장했습니다. 위 알림에서 어떻게 할지 고르세요.`, 'error');
+        return false;
+      }
+      if (!res.ok) throw new Error(syncErrText(res.error));
+      safeStorage.set(CONFIG_KEY, JSON.stringify(cfg)); setSavedAt(at);
+      dirtyRef.current = false; persistSync({ syncedVersion: res.version, localDirty: false });
+      setSyncState('ok', { remote: res, note: '' });
+      if (!silent) say(`☁ 공동 작업 저장 완료 (v${res.version} · ${at})`);
+      return true;
+    } catch (e) {
+      setSyncState('error', { note: e.message });
+      if (!silent) say(`공동 작업 저장 실패: ${e.message}`, 'error');
+      return false;
+    } finally { syncBusy.current = false; }
+  };
+  const syncActions = {
+    connect: async (form, { init } = {}) => {
+      const urlChanged = form.url !== syncRef.current.url;
+      persistSync({ url: form.url, name: form.name, pw: form.pw, remember: form.remember, auto: form.auto, ...(urlChanged ? { syncedVersion: 0, localDirty: false } : {}) });
+      const ping = await syncCall(form.url, { action: 'ping' });
+      if (!ping.ok) throw new Error(syncErrText(ping.error));
+      if (!ping.initialized) {
+        if (!init) return { needInit: true };
+        const r = await syncCall(form.url, { action: 'init', auth: syncAuth(form.pw), savedBy: form.name });
+        if (!r.ok) throw new Error(syncErrText(r.error));
+      }
+      const meta = await cloudCall({ action: 'meta' });
+      if (!meta.ok) throw new Error(syncErrText(meta.error));
+      connectedRef.current = true; setSync(x => ({ ...x, connected: true }));
+      if (meta.version === 0) { persistSync({ syncedVersion: 0 }); await cloudSave(true); say('☁ 공유를 시작했습니다. 지금 작업 상태가 첫 버전(v1)으로 저장되었습니다.'); return { ok: true }; }
+      if (meta.version > syncRef.current.syncedVersion) {
+        if (syncRef.current.syncedVersion > 0 && (dirtyRef.current || syncRef.current.localDirty)) { setSyncState('remote', { remote: meta }); return { ok: true }; }
+        const res = await cloudLoad(); if (res) await applyRemote(res);
+      } else setSyncState(dirtyRef.current ? 'dirty' : 'ok', { remote: meta });
+      return { ok: true };
+    },
+    save: async force => { const ok = await cloudSave(force); if (!ok && sync.status === 'error') throw new Error(sync.note); },
+    loadLatest: async () => { const res = await cloudLoad(); if (!res) throw new Error('공유된 데이터가 아직 없습니다.'); await applyRemote(res); },
+    history: async () => { const r = await cloudCall({ action: 'history' }); if (!r.ok) throw new Error(syncErrText(r.error)); return r.files || []; },
+    restore: async id => {
+      const res = await cloudLoad(id); if (!res) throw new Error('버전을 찾을 수 없습니다.');
+      await applyRemote(res, '🕘 이전 버전을 불러왔습니다. 새 버전으로 저장합니다…');
+      await cloudSave(false);
+    },
+    setAuto: v => { persistSync({ auto: v }); setSync(x => ({ ...x })); },
+    disconnect: () => { connectedRef.current = false; clearTimeout(autoTimer.current); persistSync({ pw: '', syncedVersion: 0, localDirty: false }); setSync({ status: 'off', remote: null, note: '', connected: false }); say('공동 작업 연결을 끊었습니다. 이제 이 브라우저에만 저장됩니다.', 'info'); },
+  };
+  const applyRemoteRef = useRef(applyRemote); applyRemoteRef.current = applyRemote;
+  const cloudSaveRef = useRef(cloudSave); cloudSaveRef.current = cloudSave;
+  const cloudLoadRef = useRef(cloudLoad); cloudLoadRef.current = cloudLoad;
+  const syncActionsRef = useRef(syncActions); syncActionsRef.current = syncActions;
+
   // 시작 시: 저장된 설정 복원 + 샘플 명단
   useEffect(() => {
     if (VIEWER) { loadViewer(); return; }
+    suppressRef.current = Date.now() + 2500;
+    // 공동 작업: 팀 비밀번호가 기억되어 있으면 자동 연결해 최신본을 받는다
+    const sc = syncRef.current;
+    if (sc.url && sc.pw) setTimeout(() => syncActionsRef.current.connect({ url: sc.url, name: sc.name, pw: sc.pw, remember: sc.remember, auto: sc.auto }).catch(e => setSyncState('error', { note: e.message })), 300);
     let cfg = null;
     try { const raw = safeStorage.get(CONFIG_KEY); if (raw) cfg = JSON.parse(raw); } catch (e) { cfg = null; }
     if (cfg) {
       const hasRoster = applyConfig(cfg);
       say(hasRoster ? `💾 마지막으로 저장한 상태(명단·시간표·설정)를 불러왔습니다. (저장 시각: ${cfg.savedAt || '-'})` : '저장된 설정을 불러왔습니다. 명단 파일을 업로드하세요.', 'info');
     } else loadSample();
+  }, []);
+
+  // 변경 감지 → (연결 중이면) 자동 저장 예약
+  const firstChange = useRef(true);
+  useEffect(() => {
+    if (VIEWER) return;
+    if (firstChange.current) { firstChange.current = false; return; }
+    if (Date.now() < suppressRef.current) return;
+    dirtyRef.current = true;
+    if (!connectedRef.current) return;
+    persistSync({ localDirty: true });
+    setSync(x => (x.status === 'ok' ? { ...x, status: 'dirty' } : x));
+    if (syncRef.current.auto) { clearTimeout(autoTimer.current); autoTimer.current = setTimeout(() => cloudSaveRef.current(false, true), SYNC_AUTOSAVE_MS()); }
+  }, [keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv, sup, roster]);
+  // 다른 사람이 저장했는지 주기적으로 확인
+  useEffect(() => {
+    if (VIEWER) return;
+    const t = setInterval(async () => {
+      if (!connectedRef.current || document.hidden || syncBusy.current) return;
+      try {
+        const m = await syncCall(syncRef.current.url, { auth: syncAuth(syncRef.current.pw), action: 'meta' });
+        if (!m.ok) { // 다른 관리자가 공유 공간을 초기화했거나 팀 비밀번호가 바뀜
+          if (m.error === 'NOT_INITIALIZED' || m.error === 'BAD_AUTH') { connectedRef.current = false; setSync(x => ({ ...x, status: 'error', connected: false, note: m.error === 'NOT_INITIALIZED' ? '다른 관리자가 공유 데이터를 초기화했습니다. [공동 작업]에서 다시 연결해 시작하세요.' : syncErrText(m.error) })); }
+          return;
+        }
+        if (m.version <= syncRef.current.syncedVersion) return;
+        if (!dirtyRef.current) { const res = await cloudLoadRef.current(); if (res) await applyRemoteRef.current(res, `☁ ${m.savedBy || '다른 분'}님이 저장한 최신본(v${m.version})으로 화면을 갱신했습니다.`); }
+        else setSync(x => (x.status === 'conflict' ? x : { ...x, status: 'remote', remote: m }));
+      } catch (e) { /* 네트워크 일시 오류는 다음 확인에서 */ }
+    }, SYNC_POLL_MS());
+    return () => clearInterval(t);
   }, []);
 
   const readFile = file => new Promise((res, rej) => {
@@ -1243,12 +1998,13 @@ function App() {
 
   // 명단 원본 + 시간표·과목코드·이동반·학급 선택·제외 키워드를 이 브라우저에 저장 (새로고침해도 유지)
   const buildConfig = savedAt => {
-    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv };
+    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv, sup };
     return sourceLabel.startsWith('샘플 데이터') ? base : { ...base, label: sourceLabel, sources: sourcesRef.current };
   };
+  const buildRef = useRef(buildConfig); buildRef.current = buildConfig;
   const saveConfig = () => {
     const savedAt = new Date().toLocaleString('ko-KR');
-    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv };
+    const base = { v: 9, savedAt, keywords, move, sel, tt, codes, exam, types, thr, times, editors, roomOv, sup };
     const isSample = sourceLabel.startsWith('샘플 데이터');
     let ok = safeStorage.set(CONFIG_KEY, JSON.stringify(isSample ? base : { ...base, label: sourceLabel, sources: sourcesRef.current }));
     if (!ok) { // 저장 공간이 부족하면 명단을 빼고 설정만 저장
@@ -1256,18 +2012,33 @@ function App() {
       if (ok) { setSavedAt(savedAt); say('⚠ 명단이 너무 커서 명단은 저장하지 못했습니다. 시간표·설정만 저장되었습니다.', 'error'); return; }
     }
     if (ok) setSavedAt(savedAt);
+    if (ok && connectedRef.current) { cloudSave(false); return; }
     say(ok ? `💾 저장 완료 (${savedAt}) — 명단${isSample ? '(샘플 제외)' : ''}·시간표·과목코드·이동반·학급 선택이 이 브라우저에 보관됩니다. 새로고침해도 유지됩니다.` : '이 브라우저에서는 저장할 수 없습니다. (개인정보 보호 모드 등)', ok ? 'success' : 'error');
   };
   // 저장 내용을 모두 지우고 처음 상태(샘플)로
-  const resetConfig = () => {
-    if (!confirm('저장된 명단·시간표·설정을 모두 지우고 처음 상태로 되돌릴까요?\n(되돌릴 수 없습니다)')) return;
+  // [설정 초기화] → 관리자 비밀번호를 한 번 더 확인 → (공동 작업 연결 중이면) 구글 시트·드라이브의 공유 데이터까지 지움
+  const resetConfig = () => setResetOpen(true);
+  const resetAll = async (pw, localOnly) => {
+    if (sha256Hex('exam-admin:' + pw) !== ADMIN_HASH) throw new Error('관리자 비밀번호가 맞지 않습니다.');
+    let shared = false;
+    if (connectedRef.current && !localOnly) {
+      const res = await cloudCall({ action: 'reset', savedBy: syncRef.current.name || '' });
+      if (!res.ok) { const e = new Error(`구글 시트(공유 데이터)를 초기화하지 못했습니다: ${syncErrText(res.error)}`); e.shared = true; throw e; }
+      shared = true;
+    }
+    if (connectedRef.current) syncActions.disconnect();
+    doLocalReset();
+    say(shared ? '🔄 초기화 완료 — 이 브라우저와 구글 시트(공유 데이터·버전 기록·팀 비밀번호)를 모두 처음 상태로 되돌렸습니다. 샘플 데이터 상태입니다.' : '🔄 이 브라우저의 설정을 초기화했습니다. 샘플 데이터 상태입니다.', 'info');
+    return shared;
+  };
+  const doLocalReset = () => {
+    suppressRef.current = Date.now() + 2500;
     safeStorage.remove(CONFIG_KEY);
     setKeywords(DEFAULT_KEYWORDS); setExam(defaultExam());
     setTypes({ 1: {}, 2: {}, 3: {} }); setThrState({ ...DEFAULT_THR }); setTimesState({ ...DEFAULT_TIMES }); setEditors({}); setRoomOv({});
     setMove({ 1: { ...DEFAULT_MOVE }, 2: { ...DEFAULT_MOVE }, 3: { ...DEFAULT_MOVE } });
-    setTT(sampleTT()); setCodes(defaultCodes()); setSavedAt('');
+    setTT(sampleTT()); setCodes(defaultCodes()); setSavedAt(''); setSup(defaultSup());
     applySources(sampleSources(), '샘플 데이터 (1~3학년, 9개 학급)', DEFAULT_KEYWORDS, {});
-    say('🔄 설정을 초기화했습니다. 샘플 데이터 상태입니다.', 'info');
   };
 
   /* ---------- 파생 데이터 ---------- */
@@ -1310,7 +2081,50 @@ function App() {
     return m;
   }, [classesByGrade, roomOv]);
   const sx = { ctx, classesByGrade, typeOf, thr, times, editors, roomMap, examTitle };
-  const statsD = tab === 'stats' || busy ? statsData(sx) : null;
+  const statsD = tab === 'stats' || tab === 'supervise' || busy ? statsData(sx) : null;
+  // 감독 시간표: 입력이 바뀔 때마다 필요한 자리·교사 상태·점검 결과를 다시 계산
+  const supM = (tab === 'supervise' || busy) && statsD ? supModel(sup, statsD, sx) : null;
+  const supChk = supM ? supCheck(supM) : null;
+  const supCnt = supM ? supCounts(supM) : null;
+  const onSupTT = async e => {
+    const file = e.target.files?.[0]; e.target.value = '';
+    if (!file) return;
+    try {
+      const { wb } = await readFile(file);
+      let r = null;
+      for (const n of wb.SheetNames) { r = parseTeacherTT(sheetRows(wb, n)); if (r) break; }
+      if (!r) { say("교사 시간표를 찾지 못했습니다. 위쪽에 요일(월~금)·교시 행이 있고, 첫 열에 '이름(시수)'가 있는 엑셀인지 확인하세요.", 'error'); return; }
+      const old = Object.fromEntries(sup.teachers.map(t => [t.name, t]));
+      const gone = sup.teachers.filter(t => !r.teachers.some(x => x.name === t.name)).map(t => t.name);
+      setSup(x => ({ ...x, ttLabel: file.name, ttPeriods: r.periods,
+        teachers: r.teachers.map(t => old[t.name] ? { ...old[t.name], hours: t.hours, tt: t.tt } : newTeacher(t.name, t.hours, t.tt)) }));
+      say(`🧑‍🏫 교사 시간표 적용: ${r.teachers.length}명 (${Object.entries(r.periods).map(([w, p]) => `${w} ${p}교시`).join(' · ')})${Object.keys(old).length ? ` · 기존 입력(담임·횟수·제외) 유지` : ''}${gone.length ? ` · 시간표에 없어 빠진 교사: ${gone.join(', ')}` : ''}`);
+    } catch (err) { say(`교사 시간표 읽기 오류: ${err.message}`, 'error'); }
+  };
+  const onSupPrev = async e => {
+    const file = e.target.files?.[0]; e.target.value = '';
+    if (!file) return;
+    try {
+      const { wb } = await readFile(file);
+      const f = parsePrevCounts(wb), names = Object.keys(f);
+      if (!names.length) { say("지난 감독표에서 '총계' 열을 찾지 못했습니다. 이 프로그램으로 내려받은 감독표 엑셀('교사(전체)' 시트)을 올리세요.", 'error'); return; }
+      const hit = sup.teachers.filter(t => t.name in f), miss = sup.teachers.filter(t => !(t.name in f)).map(t => t.name);
+      if (!confirm(`지난 감독표 '${file.name}'에서 ${names.length}명의 총계를 찾았습니다.\n명단과 일치하는 ${hit.length}명의 '이전 감독'을 총계로 바꾸고, '모고 지원'은 0으로 비웁니다.\n계속할까요?`)) return;
+      setSup(x => ({ ...x, teachers: x.teachers.map(t => (t.name in f ? { ...t, prev: f[t.name], mock: 0 } : t)) }));
+      say(`✓ 이전 감독 횟수 반영: ${hit.length}명${miss.length ? ` · 지난 감독표에 없는 교사 ${miss.length}명(그대로 둠): ${miss.slice(0, 12).join(', ')}${miss.length > 12 ? ' …' : ''}` : ''}`);
+    } catch (err) { say(`지난 감독표 읽기 오류: ${err.message}`, 'error'); }
+  };
+  const exportSup = async kind => {
+    if (!supM || !supM.slots.length) { say('시험 시간표와 교사 명단을 먼저 입력하세요.', 'error'); return; }
+    const base = `${examTitle.replace(/\s+/g, '_')}_감독표`;
+    setBusy(true);
+    try {
+      if (kind === 'xlsx') { say('감독표 엑셀 만드는 중...', 'info'); await downloadWorkbook(buildSupWorkbook(supM, examTitle, supCnt), `${base}.xlsx`); say(`✅ 감독표 엑셀 다운로드 완료 (일자별 전체 ${supM.days.length}장 · 반별 ${supM.days.length}장 · 교사(전체) 1장, A4 세로)`); }
+      if (kind === 'pdf') { const pages = supAllPages(supM, examTitle, supCnt); const blob = await pagesToPdf(pages, (i, n) => say(`PDF 만드는 중... (${i}/${n}쪽)`, 'info')); downloadBlob(blob, `${base}.pdf`); say(`✅ 감독표 PDF 다운로드 완료 (A4 ${pages.length}쪽)`); }
+      if (kind === 'hwpx') { say('한글(HWPX) 파일 만드는 중...', 'info'); const blob = await buildSupHwpx(supM, examTitle, supCnt); downloadBlob(blob, `${base}.hwpx`); say(`✅ 감독표 한글(HWPX) 다운로드 완료 — 한글 2014 이상에서 열립니다.`); }
+    } catch (err) { console.error(err); say(`감독표 만들기 오류: ${err.message}`, 'error'); }
+    finally { setBusy(false); }
+  };
 
   /* ---------- 출력 ---------- */
   const guard = () => {
@@ -1348,6 +2162,8 @@ function App() {
         <div className="flex items-center gap-2 shrink-0">
           ${VIEWER ? html`<span className="text-xs font-semibold px-3 py-1.5 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/40">일반 사용자용 · 자료 기준 ${VIEWER.createdAt}</span>` : html`
           <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-amber-400/20 text-amber-200 border border-amber-300/40">관리자</span>
+          <button id="syncBtn" onClick=${() => setSyncOpen(true)} title="여러 관리자가 작업 상태를 자동으로 공유" className=${`text-sm px-3.5 py-2.5 rounded-lg border font-semibold ${{ ok: 'bg-emerald-600/20 border-emerald-400/50 text-emerald-100', dirty: 'bg-amber-500/20 border-amber-300/50 text-amber-100', saving: 'bg-amber-500/20 border-amber-300/50 text-amber-100', connecting: 'bg-slate-800 border-slate-600 text-slate-200', remote: 'bg-sky-500/25 border-sky-300/60 text-sky-100', conflict: 'bg-rose-500/25 border-rose-300/60 text-rose-100', error: 'bg-rose-500/25 border-rose-300/60 text-rose-100', needpw: 'bg-sky-500/25 border-sky-300/60 text-sky-100' }[sync.status] || 'bg-slate-800 border-slate-700 text-slate-200'}`}>
+            ${{ off: '👥 공동 작업', connecting: '☁ 연결 중…', ok: `☁ 동기화됨 v${syncRef.current.syncedVersion}`, dirty: '☁ 저장 대기…', saving: '☁ 저장 중…', remote: '🔔 새 버전 있음', conflict: '⚠ 저장 충돌', error: '⚠ 연결 오류', needpw: '👥 비밀번호 입력' }[sync.status] || '👥 공동 작업'}</button>
           <button onClick=${loadSample} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">✨ 샘플 데이터 로드</button>
           <button id="saveBtn" onClick=${saveConfig} title=${savedAt ? `마지막 저장: ${savedAt}` : '아직 저장하지 않음'} className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">💾 설정 저장</button>
           <button id="cfgFileBtn" onClick=${() => setCfgOpen(true)} title="작업 상태를 파일로 백업하거나 다른 PC에서 불러오기" className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm px-3.5 py-2.5 rounded-lg border border-slate-700">📁 설정 파일</button>
@@ -1365,8 +2181,22 @@ function App() {
       </div>
     </div>
 
+    ${!VIEWER && ['remote', 'conflict', 'error', 'needpw'].includes(sync.status) && html`<div id="syncBanner" className=${`px-6 py-3 border-b text-sm ${sync.status === 'error' ? 'bg-rose-50 border-rose-200 text-rose-900' : sync.status === 'needpw' ? 'bg-sky-50 border-sky-200 text-sky-900' : 'bg-amber-50 border-amber-300 text-amber-900'}`}>
+      <div className="max-w-[1500px] mx-auto flex flex-wrap items-center gap-2">
+        ${sync.status === 'remote' && html`<span>🔔 <b>${sync.remote?.savedBy || '다른 분'}</b>님이 ${sync.remote?.savedAt}에 새 버전(v${sync.remote?.version})을 저장했습니다. 내 화면에는 아직 저장하지 않은 변경이 있습니다.</span>`}
+        ${sync.status === 'conflict' && html`<span>⚠ 저장하는 사이 <b>${sync.remote?.savedBy || '다른 분'}</b>님이 ${sync.remote?.savedAt}에 먼저 저장했습니다(v${sync.remote?.version}). 어느 쪽을 남길지 고르세요.</span>`}
+        ${sync.status === 'error' && html`<span>⚠ 공동 작업 연결 오류: ${sync.note}</span>`}
+        ${sync.status === 'needpw' && html`<span>👥 공동 작업에 연결하려면 팀 비밀번호를 입력하세요.</span>`}
+        <span className="ml-auto flex gap-1.5">
+          ${(sync.status === 'remote' || sync.status === 'conflict') && html`
+            <button id="bannerLoad" onClick=${() => syncActions.loadLatest().catch(e => say(e.message, 'error'))} className="px-3 py-1.5 rounded-lg bg-white border border-amber-400 font-semibold">최신본 불러오기 (내 변경 버림)</button>
+            <button id="bannerOverwrite" onClick=${() => { if (confirm('다른 분이 저장한 최신 내용을 내 화면 내용으로 덮어쓸까요?\n(그분의 변경은 버전 기록에서 되살릴 수 있습니다)')) cloudSave(true); }} className="px-3 py-1.5 rounded-lg bg-amber-500 text-slate-900 font-bold">내 변경으로 덮어쓰기</button>`}
+          ${(sync.status === 'error' || sync.status === 'needpw') && html`<button onClick=${() => setSyncOpen(true)} className="px-3 py-1.5 rounded-lg bg-white border border-slate-300 font-semibold">공동 작업 설정</button>`}
+        </span>
+      </div>
+    </div>`}
     <main className="max-w-[1500px] mx-auto w-full p-4 md:p-6 grid grid-cols-1 xl:grid-cols-12 gap-6 flex-grow">
-      ${!VIEWER && html`
+      ${!VIEWER && tab !== 'supervise' && html`
       <div className="xl:col-span-4 space-y-4">
         ${/* STEP 1 */''}
         <${Card} step="1" title="시험 선택">
@@ -1470,9 +2300,9 @@ function App() {
       </div>
 
       `}
-      <div className=${`${VIEWER ? 'xl:col-span-12' : 'xl:col-span-8'} bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col min-w-0`}>
+      <div className=${`${VIEWER || tab === 'supervise' ? 'xl:col-span-12' : 'xl:col-span-8'} bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col min-w-0`}>
         <div className="flex flex-wrap gap-1 px-3 pt-3 border-b border-slate-200 bg-slate-50 rounded-t-xl">
-          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표'], ['absence', '📋 결시 학생 현황'], ['stats', '📈 고사실 통계']].filter(([k]) => !VIEWER || k === 'chalkboard' || k === 'overview' || k === 'confirm').map(([k, label]) => html`
+          ${[['timetable', '📅 시간표 확인·수정'], ['chalkboard', '🖨 칠판 부착용(B4)'], ['overview', '📊 과목별 응시현황'], ['confirm', '📝 반별 응시확인표'], ['absence', '📋 결시 학생 현황'], ['stats', '📈 고사실 통계'], ['supervise', '🧑‍🏫 감독 시간표']].filter(([k]) => !VIEWER || k === 'chalkboard' || k === 'overview' || k === 'confirm').map(([k, label]) => html`
             <button key=${k} data-tab=${k} onClick=${() => setTab(k)} className=${`px-3.5 py-2 text-xs rounded-t-lg ${tab === k ? 'bg-white text-indigo-700 font-bold border border-b-white border-slate-200 -mb-px' : 'text-slate-600 hover:bg-slate-100'}`}>${label}</button>`)}
         </div>
         <div className="p-4 overflow-auto">
@@ -1484,12 +2314,16 @@ function App() {
           ${tab === 'stats' && !VIEWER && statsD && html`<${StatsTab} sx=${sx} D=${statsD} classesByGrade=${classesByGrade} busy=${busy} onExport=${() => exportFile(4)}
               setThr=${(k, v) => setThrState(x => ({ ...x, [k]: v }))} setTimes=${(pp, v) => setTimesState(x => ({ ...x, [pp]: v }))}
               setEditor=${(k, v) => setEditors(x => ({ ...x, [k]: v }))} setRoom=${(hk, v) => setRoomOv(x => ({ ...x, [hk]: v }))} resetRooms=${() => setRoomOv({})} />`}
+          ${tab === 'supervise' && !VIEWER && supM && html`<${SuperviseTab} sup=${sup} setSup=${setSup} m=${supM} chk=${supChk} counts=${supCnt} examTitle=${examTitle} classesByGrade=${classesByGrade} say=${say}
+              onUploadTT=${onSupTT} onImportPrev=${onSupPrev} onExport=${exportSup} busy=${busy} />`}
           ${tab === 'absence' && !VIEWER && html`<${AbsencePreview} ab=${ab} setAb=${setAb} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} roomMap=${roomMap} onExport=${t => exportFile(3, t)} onExportRooms=${pairs => exportFile(5, null, pairs)} busy=${busy} />`}
         </div>
       </div>
     </main>
+    ${syncOpen && html`<${SyncDialog} onClose=${() => setSyncOpen(false)} conf=${syncRef.current} sync=${sync} actions=${syncActions} busyFlag=${syncBusy.current} />`}
     ${cfgOpen && html`<${ConfigFileDialog} onClose=${() => setCfgOpen(false)} buildConfig=${buildConfig} applyConfig=${applyConfig} say=${say} />`}
     ${shareOpen && html`<${ShareDialog} onClose=${() => setShareOpen(false)} makePayload=${makePayload} say=${say} />`}
+    ${resetOpen && html`<${ResetDialog} onClose=${() => setResetOpen(false)} connected=${sync.connected} syncConf=${syncRef.current} onReset=${resetAll} />`}
   </div>`;
 }
 
@@ -1743,6 +2577,249 @@ function StatsTab({ sx, D, setThr, setTimes, setEditor, setRoom, resetRooms, cla
   </div>`;
 }
 
+/* ------------------------------ 감독 시간표 탭 (관리자) ------------------------------ */
+const SUP_KIND_CLS = { R: 'bg-white', C: 'bg-emerald-100 text-emerald-900', W: 'bg-white text-red-600 font-bold', H: 'bg-sky-300 text-sky-950 font-bold', X: 'bg-orange-100 text-orange-800', L: 'bg-slate-100 text-slate-400', '': 'bg-white' };
+function SupBox({ title, sub, children, id }) {
+  return html`<div className="border border-slate-200 rounded-xl p-3.5" id=${id}><div className="text-sm font-bold text-slate-800">${title}</div>${sub && html`<p className="text-[11px] text-slate-500 mt-0.5 mb-2">${sub}</p>`}${children}</div>`;
+}
+function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, say, onUploadTT, onImportPrev, onExport, busy }) {
+  const [view, setView] = useState(sup.teachers.length ? 'grid' : 'list');
+  const [dayI, setDayI] = useState(0);
+  const [pick, setPick] = useState(null);
+  const [q, setQ] = useState('');
+  const [newName, setNewName] = useState('');
+  const dragRef = useRef(null);
+  const upd = fn => setSup(x => { const n = deepClone(x); fn(n); return n; });
+  const updT = (name, fn) => upd(x => { const t = x.teachers.find(y => y.name === name); if (t) fn(t); });
+  const allClasses = GRADES.flatMap(g => classesByGrade[g].map(c => clsKey(g, c)));
+  const examOpts = GRADES.flatMap(g => m.examSubs[g].map(sub => ({ k: `${g}|${norm(sub)}`, label: `${g}학년 ${sub}` })));
+  const labelOfKey = k => (examOpts.find(o => o.k === k) || { label: k.replace('|', '학년 ') }).label;
+  const nAssigned = Object.values(sup.assign || {}).reduce((a, o) => a + Object.keys(o).length, 0);
+  const nPos = m.slots.reduce((a, s) => a + s.pos.length, 0);
+  const homeDup = (() => { const c = {}; m.teachers.forEach(t => { if (t.home) c[t.home] = (c[t.home] || 0) + 1; }); return Object.keys(c).filter(k => c[k] > 1); })();
+  const shown = m.teachers.filter(t => !q || t.name.includes(q.trim()));
+
+  const generate = () => {
+    if (!m.teachers.length) { say('교사 주간시간표를 먼저 올리세요.', 'error'); return; }
+    if (!m.slots.length) { say('시험 시간표가 비어 있습니다. 시험 시간표를 먼저 입력하세요.', 'error'); return; }
+    if (nAssigned && !confirm('지금 편성표(직접 바꾼 내용 포함)를 지우고 처음부터 자동 편성할까요?')) return;
+    const a = supGenerate(m);
+    const c2 = supCheck({ ...m, sup: { ...m.sup, assign: a } });
+    const k2 = supCounts({ ...m, sup: { ...m.sup, assign: a } });
+    const act = m.teachers.filter(t => (t.ex || {}).mode !== 'all').map(t => k2[t.name].now);
+    upd(x => { x.assign = a; x.genAt = new Date().toLocaleString('ko-KR'); });
+    setView('grid'); setPick(null);
+    say(`⚙ 자동 편성 완료 — 감독 자리 ${nPos - c2.nMiss}/${nPos}개 배치${c2.nMiss ? ` · ⚠ 사람이 모자라 비어 있는 자리 ${c2.nMiss}개` : ''} · 교사별 이번 감독 ${act.length ? Math.min(...act) : 0}~${act.length ? Math.max(...act) : 0}회`, c2.nMiss ? 'error' : 'success');
+  };
+  // 같은 교시(열) 안에서 1:1 맞바꾸기 · 미배정 자리 넣기 · 자리 비우기
+  const act = (src, dst) => {
+    if (!src || !dst) return;
+    if (src.k !== dst.k) { say('⛔ 같은 시험 교시(같은 열) 안에서만 바꿀 수 있습니다.', 'error'); return; }
+    const s = m.slots.find(x => x.key === src.k); if (!s) return;
+    const A = { ...((sup.assign || {})[s.key] || {}) };
+    let msg = '';
+    if (src.t && dst.t) {
+      if (src.t === dst.t) return;
+      const ca = A[src.t] || '', cb = A[dst.t] || '';
+      if (!ca && !cb) return;
+      const err = (cb && supCan(m, s, src.t, cb)) || (ca && supCan(m, s, dst.t, ca));
+      if (err) { say(`⛔ 바꿀 수 없습니다 — ${err}`, 'error'); return; }
+      if (cb) A[src.t] = cb; else delete A[src.t];
+      if (ca) A[dst.t] = ca; else delete A[dst.t];
+      msg = cb && ca ? `${src.t}(${supText(cb)}) ↔ ${dst.t}(${supText(ca)}) 맞바꿈` : `${ca ? dst.t : src.t} 선생님이 ${supText(ca || cb)}을(를) 맡음`;
+    } else if (src.code && dst.t) {
+      const err = supCan(m, s, dst.t, src.code);
+      if (err) { say(`⛔ 넣을 수 없습니다 — ${err}`, 'error'); return; }
+      const prev = A[dst.t]; A[dst.t] = src.code;
+      msg = `${dst.t} 선생님 → ${supText(src.code)}${prev ? ` (원래 맡던 ${supText(prev)}는 미배정으로)` : ''}`;
+    } else if (src.t && dst.zone) {
+      const prev = A[src.t]; if (!prev) return; delete A[src.t];
+      msg = `${src.t} 선생님의 ${supText(prev)} 자리를 비움 (미배정)`;
+    } else return;
+    upd(x => { x.assign = { ...(x.assign || {}), [s.key]: A }; });
+    say(`✓ ${s.md} ${s.p}교시: ${msg}`);
+  };
+  const clickCell = target => {
+    if (!pick) { if (target.code || (target.t && ((sup.assign || {})[target.k] || {})[target.t])) setPick(target); return; }
+    const same = pick.k === target.k && pick.t === target.t && pick.code === target.code;
+    if (!same) act(pick, target);
+    setPick(null);
+  };
+  const dnd = target => ({
+    onDragOver: e => { if (dragRef.current) e.preventDefault(); },
+    onDrop: e => { e.preventDefault(); const src = dragRef.current; dragRef.current = null; if (src) act(src, target); },
+  });
+  const drag = src => ({ draggable: true, onDragStart: e => { dragRef.current = src; e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', JSON.stringify(src)); } catch (x) { /* 무시 */ } }, onDragEnd: () => { setTimeout(() => { dragRef.current = null; }, 0); } });
+  const isPick = (k, t, code) => pick && pick.k === k && pick.t === t && pick.code === code;
+
+  const toggleSub = (name, k, on) => updT(name, t => {
+    t.subAdd = (t.subAdd || []).filter(x => x !== k); t.subDel = (t.subDel || []).filter(x => x !== k);
+    const auto = m.autoSubs[name] && m.autoSubs[name].has(k);
+    if (on && !auto) t.subAdd.push(k); if (!on && auto) t.subDel.push(k);
+  });
+  const removeTeacher = name => { if (!confirm(`${name} 선생님을 명단에서 뺄까요? (편성표의 자리도 비워집니다)`)) return; upd(x => { x.teachers = x.teachers.filter(t => t.name !== name); Object.values(x.assign || {}).forEach(A => { delete A[name]; }); }); };
+  const addTeacher = () => {
+    const n = newName.replace(/\s+/g, ''); if (!n) return;
+    if (sup.teachers.some(t => t.name === n)) { say(`이미 있는 이름입니다: ${n}`, 'error'); return; }
+    upd(x => { x.teachers.push(newTeacher(n)); }); setNewName(''); say(`+ ${n} 선생님을 추가했습니다. (시간표가 없어 수업 제외·같은 과목 자동 찾기는 적용되지 않습니다)`, 'info');
+  };
+
+  const views = [['list', `👥 교사 명단 (${m.teachers.length})`], ['cond', '⚙ 배치 조건'], ['grid', '🗂 교사(전체) 편성·수정'], ['day', '📄 일자별 감독표'], ['cls', '🏫 반별 감독표']];
+  const top = html`<div className="space-y-2">
+    <div className="flex flex-wrap items-center gap-1.5">
+      <label className=${`${pbtn} bg-emerald-600 text-white cursor-pointer`}>⬆ 교사 주간시간표 올리기<input id="supTTInput" type="file" accept=".xlsx,.xls,.xlsm" onChange=${onUploadTT} className="hidden" /></label>
+      <label className=${`${pbtn} bg-slate-700 text-white cursor-pointer`} title="이 프로그램으로 만든 지난 감독표 엑셀의 '교사(전체)' 시트에서 교사별 총계를 '이전 감독 횟수'로 가져옵니다">⬆ 지난 감독표에서 횟수 불러오기<input id="supPrevInput" type="file" accept=".xlsx,.xls,.xlsm" onChange=${onImportPrev} className="hidden" /></label>
+      <button id="supGen" onClick=${generate} className=${`${pbtn} bg-indigo-600 text-white`}>⚙ 자동 편성</button>
+      <span className="ml-auto flex flex-wrap gap-1.5">
+        <button id="supXl" disabled=${busy || !m.slots.length} onClick=${() => onExport('xlsx')} className=${`${pbtn} bg-emerald-700 text-white`}>⬇ 엑셀</button>
+        <button id="supPdf" disabled=${busy || !m.slots.length} onClick=${() => onExport('pdf')} className=${`${pbtn} bg-rose-600 text-white`}>⬇ PDF</button>
+        <button id="supHwpx" disabled=${busy || !m.slots.length} onClick=${() => onExport('hwpx')} className=${`${pbtn} bg-sky-700 text-white`}>⬇ 한글(HWPX)</button>
+        <button id="supPrint" disabled=${!m.slots.length} onClick=${() => printPages(supAllPages(m, examTitle, counts), 'a4')} className=${`${pbtn} bg-slate-800 text-white`}>🖨 전체 인쇄</button>
+      </span>
+    </div>
+    <div className="flex flex-wrap items-center gap-1.5 text-xs" id="supSummary">
+      <span className="px-2.5 py-1 rounded-full bg-slate-100 font-semibold">교사 ${m.teachers.length}명${sup.ttLabel ? ` · ${sup.ttLabel}` : ''}</span>
+      <span className="px-2.5 py-1 rounded-full bg-slate-100 font-semibold">시험 교시 ${m.slots.length}개 · 감독 자리 ${nPos}개</span>
+      <span className=${`px-2.5 py-1 rounded-full font-semibold ${chk.nMiss ? 'bg-amber-50 text-amber-800 border border-amber-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>미배정 ${chk.nMiss}</span>
+      <span className=${`px-2.5 py-1 rounded-full font-semibold ${chk.nErr ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>규칙 위반 ${chk.nErr}</span>
+      ${sup.genAt && html`<span className="text-slate-400">자동 편성: ${sup.genAt}</span>`}
+    </div>
+    ${chk.list.length > 0 && html`<details className="text-[11px] text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5" id="supIssues"><summary className="font-semibold">⚠ 확인할 내용 ${chk.list.length}건</summary><ul className="mt-1 space-y-0.5 list-disc pl-4">${chk.list.slice(0, 60).map((x, i) => html`<li key=${i}>${x}</li>`)}</ul></details>`}
+    <div className="flex flex-wrap gap-1 border-b border-slate-200">${views.map(([k, label]) => html`<button key=${k} data-supview=${k} onClick=${() => setView(k)} className=${`px-3 py-1.5 text-xs -mb-px border-b-2 ${view === k ? 'border-indigo-600 text-indigo-700 font-bold' : 'border-transparent text-slate-500 hover:text-slate-800'}`}>${label}</button>`)}</div>
+  </div>`;
+
+  if (!m.teachers.length && view !== 'cond') return html`<div className="space-y-3" id="supTab">${top}
+    <div className="p-8 text-center text-sm text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-300">
+      <div className="text-3xl mb-2">🧑‍🏫</div>
+      <p><b>교사 주간시간표</b>(나이스 '교사별 주간시간표' 엑셀: 1열 '이름(시수)', 칸 '302 / B_언매')를 올리면 교사 명단이 만들어집니다.</p>
+      <p className="mt-1 text-xs">그다음 담임·이전 감독 횟수·감독 제외를 입력하고 [⚙ 자동 편성]을 누르세요. 시험 시간표·출제자·감독 인원(고사실 통계)은 다른 탭의 내용을 그대로 씁니다.</p>
+    </div></div>`;
+
+  /* ---- 교사 명단 ---- */
+  const listView = html`<div>
+    <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
+      <input value=${q} onInput=${e => setQ(e.target.value)} placeholder="🔍 이름 찾기" className="border border-slate-300 rounded-md px-2 py-1 w-32" />
+      <span className="text-slate-500">전체 기간 제외 ${m.teachers.filter(t => (t.ex || {}).mode === 'all').length}명 · 일부 날짜 제외 ${m.teachers.filter(t => (t.ex || {}).mode === 'days').length}명 · 담임 ${m.teachers.filter(t => t.home).length}명</span>
+      ${homeDup.length > 0 && html`<span className="text-rose-600 font-semibold">⚠ 담임 학급 중복: ${homeDup.join(', ')}</span>`}
+      <span className="ml-auto flex gap-1"><input id="supNewName" value=${newName} onInput=${e => setNewName(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') addTeacher(); }} placeholder="이름" className="border border-slate-300 rounded-md px-2 py-1 w-24" /><button id="supAddT" onClick=${addTeacher} className="px-2.5 py-1 rounded-md border border-slate-300 hover:bg-slate-50 font-semibold">+ 교사 추가</button></span>
+    </div>
+    <div className="overflow-x-auto border border-slate-200 rounded-lg">
+    <table className="w-full text-xs border-collapse" id="supTeachers">
+      <thead className="bg-slate-50 text-slate-600 sticky top-0"><tr>
+        <th className="p-1.5 border-b border-slate-200 w-8">#</th><th className="border-b border-slate-200 text-left">교사 (시수)</th><th className="border-b border-slate-200 text-left">담당 (시간표)</th>
+        <th className="border-b border-slate-200 text-left" title="이 과목 시험 시간에는 교실 감독 대신 복도 감독(고사본부 앞 우선)">같은 과목 시험 → 복도</th>
+        <th className="border-b border-slate-200">담임</th><th className="border-b border-slate-200" title="이번 시험 전까지의 감독 횟수(누계)">이전 감독</th><th className="border-b border-slate-200">모고 지원</th>
+        <th className="border-b border-slate-200 text-left">감독 제외 (관리·개인 사유)</th><th className="border-b border-slate-200 w-6"></th></tr></thead>
+      <tbody>${shown.map(t => { const ex = t.ex || {}; const subs = [...(m.subsOf[t.name] || [])]; return html`<tr key=${t.name} data-t=${t.name} className=${`border-t border-slate-100 align-top ${ex.mode === 'all' ? 'bg-orange-50/60' : ''}`}>
+        <td className="p-1.5 text-center text-slate-400">${m.teachers.indexOf(t) + 1}</td>
+        <td className="p-1.5 whitespace-nowrap"><b>${t.name}</b> <span className="text-slate-400">(${t.hours || 0})</span></td>
+        <td className="p-1.5 text-[10px] text-slate-500 max-w-[170px]">${m.teachSum[t.name] || '-'}</td>
+        <td className="p-1.5"><div className="flex flex-wrap gap-1 max-w-[230px]">
+          ${subs.map(k => html`<span key=${k} className=${`inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] ${m.autoSubs[t.name].has(k) ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-violet-50 text-violet-800 border border-violet-200'}`} title=${m.autoSubs[t.name].has(k) ? '시간표에서 자동으로 찾음' : '직접 추가'}>${labelOfKey(k)}<button onClick=${() => toggleSub(t.name, k, false)} className="text-slate-400 hover:text-rose-600">×</button></span>`)}
+          <select data-subadd=${t.name} value="" onChange=${e => { if (e.target.value) toggleSub(t.name, e.target.value, true); }} className="border border-dashed border-slate-300 rounded px-1 py-0.5 text-[10px] text-slate-500 bg-white w-16"><option value="">+ 과목</option>${examOpts.filter(o => !subs.includes(o.k)).map(o => html`<option key=${o.k} value=${o.k}>${o.label}</option>`)}</select></div></td>
+        <td className="p-1.5 text-center"><select data-home=${t.name} value=${t.home || ''} onChange=${e => updT(t.name, x => { x.home = e.target.value; })} className=${`border rounded px-1 py-0.5 ${homeDup.includes(t.home) ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}><option value="">-</option>${allClasses.map(k => html`<option key=${k} value=${k}>${k}</option>`)}</select></td>
+        <td className="p-1.5 text-center"><input data-prev=${t.name} type="number" min="0" value=${t.prev || 0} onInput=${e => updT(t.name, x => { x.prev = Math.max(0, parseInt(e.target.value) || 0); })} className="w-12 border border-slate-300 rounded px-1 py-0.5 text-center" /></td>
+        <td className="p-1.5 text-center"><input data-mock=${t.name} type="number" min="0" value=${t.mock || 0} onInput=${e => updT(t.name, x => { x.mock = Math.max(0, parseInt(e.target.value) || 0); })} className="w-11 border border-slate-300 rounded px-1 py-0.5 text-center" /></td>
+        <td className="p-1.5"><div className="flex flex-wrap items-center gap-1">
+          <select data-ex=${t.name} value=${ex.mode || ''} onChange=${e => updT(t.name, x => { x.ex = { ...(x.ex || {}), mode: e.target.value, days: (x.ex || {}).days || {} }; })} className="border border-slate-300 rounded px-1 py-0.5"><option value="">감독함</option><option value="all">전체 기간 제외</option><option value="days">일부 날짜 제외</option></select>
+          ${ex.mode === 'days' && m.days.map(d => html`<label key=${d.d} className="inline-flex items-center gap-0.5 text-[10px]"><input type="checkbox" data-exday=${`${t.name}|${d.d}`} checked=${!!(ex.days || {})[d.d]} onChange=${e => updT(t.name, x => { x.ex.days = { ...(x.ex.days || {}), [d.d]: e.target.checked }; })} />${d.sh}</label>`)}
+          ${ex.mode && html`<input data-reason=${t.name} value=${ex.reason || ''} onInput=${e => updT(t.name, x => { x.ex.reason = e.target.value; })} placeholder="사유 (예: 관리(총괄), 출장)" className="border border-slate-300 rounded px-1.5 py-0.5 w-32" />`}
+        </div></td>
+        <td className="p-1.5 text-center"><button title="명단에서 빼기" onClick=${() => removeTeacher(t.name)} className="text-slate-300 hover:text-rose-600 font-bold">×</button></td>
+      </tr>`; })}</tbody>
+    </table></div>
+    <p className="text-[11px] text-slate-500 mt-2">· <b>같은 과목</b>: 초록 = 시간표 약칭으로 자동 인식(예: 언매 → 언어와 매체), 보라 = 직접 추가. 틀리면 ×로 빼세요. · <b>담임</b> 교사는 자기 반 교실과 자기 반 이동반이 가는 교실을 감독하지 않습니다. · <b>이전 감독</b>은 이번 시험 전까지의 누계(지난 감독표의 '총계')입니다.</p>
+  </div>`;
+
+  /* ---- 배치 조건 ---- */
+  const examPs = [...new Set(m.slots.map(s => s.p))].sort((a, b) => a - b);
+  const maxCP = Math.max(7, ...Object.values(sup.ttPeriods || {}));
+  const condView = html`<div className="grid lg:grid-cols-2 gap-3">
+    <${SupBox} id="supCls" title="시험 없이 수업하는 학년 (필수 반영)" sub="체크한 학년은 그날 정상 수업을 합니다. 그 학년 수업이 있는 교사는 해당 교시 감독에서 자동으로 빠지고, 그 학년 교실은 감독 자리가 없습니다. 처음에는 '그날 시험이 없는 학년'이 체크됩니다.">
+      ${!m.days.length ? html`<p className="text-xs text-slate-400">시험 시간표가 없습니다.</p>` : html`<table className="w-full text-xs border-collapse"><thead><tr className="bg-slate-50"><th className="border border-slate-200 p-1">일차</th><th className="border border-slate-200">요일 (교사 시간표)</th>${m.present.map(g => html`<th key=${g} className="border border-slate-200">${g}학년 수업</th>`)}</tr></thead>
+        <tbody>${m.days.map(d => html`<tr key=${d.d}><td className="border border-slate-200 p-1 text-center font-semibold">${d.md}</td>
+          <td className="border border-slate-200 text-center"><select data-wd=${d.d} value=${(sup.wd || {})[d.d] || ''} onChange=${e => upd(x => { x.wd = { ...(x.wd || {}), [d.d]: e.target.value }; })} className="border border-slate-300 rounded px-1 py-0.5"><option value="">자동 (${d.awd || '?'})</option>${['월', '화', '수', '목', '금'].map(w => html`<option key=${w} value=${w}>${w}요일</option>`)}</select></td>
+          ${m.present.map(g => html`<td key=${g} className="border border-slate-200 text-center"><input type="checkbox" data-cls=${`${d.d}-${g}`} checked=${d.slots[0].classG.includes(g)} onChange=${e => upd(x => { x.cls = { ...(x.cls || {}), [`${d.d}-${g}`]: e.target.checked }; })} /></td>`)}</tr>`)}</tbody></table>`}
+    <//>
+    <${SupBox} id="supPmap" title="시험 교시 ↔ 수업 교시" sub="시험 교시 시간에 겹치는 수업 교시를 고르세요. 수업하는 학년의 이 교시 수업이 있는 교사를 감독에서 뺍니다.">
+      <div className="space-y-1.5">${(examPs.length ? examPs : [1, 2, 3]).map(p => html`<div key=${p} className="flex flex-wrap items-center gap-1.5 text-xs"><span className="w-14 font-bold">시험 ${p}교시</span><span className="text-slate-400">→ 수업</span>
+        ${Array.from({ length: maxCP }, (_, i) => i + 1).map(cp => { const on = ((sup.pmap || {})[p] || [p]).includes(cp); return html`<label key=${cp} className=${`px-1.5 py-0.5 rounded border cursor-pointer ${on ? 'bg-indigo-600 text-white border-indigo-600' : 'border-slate-300 text-slate-500'}`}><input type="checkbox" className="hidden" data-pmap=${`${p}-${cp}`} checked=${on} onChange=${e => upd(x => { const cur = ((x.pmap || {})[p] || [p]).filter(v => v !== cp); x.pmap = { ...(x.pmap || {}), [p]: e.target.checked ? [...cur, cp].sort((a, b) => a - b) : cur }; })} />${cp}</label>`; })}</div>`)}</div>
+    <//>
+    <${SupBox} id="supPosts" title="복도 감독 위치" sub="같은 과목 시험 교사를 먼저 복도에 배치하고, ★(고사본부 앞) 위치를 가장 먼저 채웁니다. 남는 자리는 다른 교사로 채웁니다.">
+      <div className="space-y-1">${(sup.posts || []).map((p, i) => html`<div key=${i} className="flex items-center gap-1.5 text-xs">
+        <button title="고사본부 앞 (같은 과목 교사 우선)" onClick=${() => upd(x => { x.posts[i].hq = !x.posts[i].hq; })} className=${`w-6 h-6 rounded ${p.hq ? 'bg-amber-400 text-slate-900' : 'bg-slate-100 text-slate-300'}`}>★</button>
+        <input data-post=${i} value=${p.name} onInput=${e => upd(x => { x.posts[i].name = e.target.value; })} className="w-24 border border-slate-300 rounded px-1.5 py-0.5 font-semibold" />
+        <input value=${p.desc || ''} onInput=${e => upd(x => { x.posts[i].desc = e.target.value; })} placeholder="담당 구역 (예: 1학년 10,11반)" className="flex-1 border border-slate-300 rounded px-1.5 py-0.5" />
+        <button onClick=${() => upd(x => { x.posts.splice(i, 1); })} className="text-slate-300 hover:text-rose-600 font-bold px-1">×</button></div>`)}
+        <button id="supAddPost" onClick=${() => upd(x => { x.posts = [...(x.posts || []), { name: '', desc: '' }]; })} className="text-[11px] px-2 py-0.5 rounded border border-slate-300 hover:bg-slate-50">+ 위치 추가</button></div>
+    <//>
+    <${SupBox} title="대기 · 고르게 배치" sub="대기 감독은 감독 횟수에 넣지 않고 따로 고르게 돌립니다.">
+      <div className="space-y-2 text-xs">
+        <label className="flex items-center gap-2"><span className="w-40 font-semibold">교시마다 대기 감독</span><input id="supStandby" type="number" min="0" max="10" value=${sup.standby} onInput=${e => upd(x => { x.standby = Math.max(0, parseInt(e.target.value) || 0); })} className="w-14 border border-slate-300 rounded px-1 py-0.5 text-center" />명</label>
+        <label className="flex items-center gap-2"><span className="w-40 font-semibold">이전 횟수 반영 폭</span>±<input id="supPrevK" type="number" min="0" max="10" value=${sup.prevK} onInput=${e => upd(x => { x.prevK = Math.max(0, parseInt(e.target.value) || 0); })} className="w-14 border border-slate-300 rounded px-1 py-0.5 text-center" />회</label>
+        <p className="text-[11px] text-slate-500">이전 감독+모고 지원이 평균보다 많은 교사는 이번에 최대 이 횟수만큼 덜, 적은 교사는 더 맡습니다. (0 = 이번 시험만 똑같이) 한 날에 몰리지 않도록 날짜별로도 고르게 나눕니다.</p>
+      </div>
+    <//>
+    <div className="lg:col-span-2"><${SupBox} title="감독표 안내문" sub="일자별 감독표 오른쪽에 들어갑니다.">
+      <textarea id="supNote" value=${sup.note} onInput=${e => upd(x => { x.note = e.target.value; })} rows="8" className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-xs font-mono"></textarea>
+      <button onClick=${() => upd(x => { x.note = DEFAULT_SUP_NOTE; })} className="text-[11px] px-2 py-0.5 rounded border border-slate-300 hover:bg-slate-50">기본 문구로</button>
+    <//></div>
+  </div>`;
+
+  /* ---- 교사(전체) 편성표: 끌어서 놓거나 두 칸을 차례로 눌러 1:1로 맞바꿈 ---- */
+  const S = m.slots;
+  const dl = i => (i > 0 && S[i - 1].d !== S[i].d ? 'border-l-2 border-l-slate-800' : '');
+  const gridView = html`<div>
+    <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
+      <input value=${q} onInput=${e => setQ(e.target.value)} placeholder="🔍 이름 찾기" className="border border-slate-300 rounded-md px-2 py-1 w-32" />
+      <span className="text-slate-500">칸을 <b>끌어서 같은 열의 다른 교사 칸에 놓으면</b> 두 사람의 자리가 맞바뀝니다. (또는 두 칸을 차례로 클릭) 규칙에 어긋나면 바뀌지 않고 이유를 알려 줍니다. 맨 아래 <b>미배정</b> 줄로 끌면 자리를 비웁니다.</span>
+      ${pick && html`<span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-semibold">선택됨: ${pick.t || supText(pick.code)} — 바꿀 칸을 누르세요 <button onClick=${() => setPick(null)} className="underline ml-1">취소</button></span>`}
+    </div>
+    <div className="flex flex-wrap gap-1.5 mb-2 text-[10px]">${[['R', '교실 1-5(정)/(부)'], ['C', '복도'], ['W', '대기'], ['H', '♣ 출제자(본부)'], ['X', '관리·제외'], ['L', '수업']].map(([k, l]) => html`<span key=${k} className=${`px-1.5 py-0.5 rounded border border-slate-200 ${SUP_KIND_CLS[k]}`}>${l}</span>`)}<span className="px-1.5 py-0.5 rounded border border-slate-200 text-slate-400">동 = 같은 과목 시험(교실 불가)</span></div>
+    <div className="overflow-auto border border-slate-300 rounded-lg max-h-[72vh]">
+      <table className="text-[11px] border-collapse" id="supGrid">
+        <thead className="sticky top-0 z-10">
+          <tr className="bg-slate-100"><th rowSpan="2" className="sticky left-0 z-20 bg-slate-100 border border-slate-300 px-2">교사</th>
+            ${m.days.map(d => html`<th key=${d.d} colSpan=${d.slots.length} className="border border-slate-300 px-1 py-1 bg-sky-50">${d.sh}</th>`)}
+            ${['교실', '복도', '대기', '모고', '이전', '총계'].map(t => html`<th key=${t} rowSpan="2" className=${`border border-slate-300 px-1.5 ${t === '총계' ? 'bg-amber-100' : ''}`}>${t}</th>`)}</tr>
+          <tr className="bg-violet-100">${S.map((s, i) => html`<th key=${s.key} className=${`border border-slate-300 px-1 py-0.5 font-semibold ${dl(i)}`} title=${GRADES.map(g => `${g}학년 ${s.subs[g].join('/') || '-'}`).join('\n')}>${s.p}교시<div className="text-[9px] font-normal text-slate-500 max-w-[70px] truncate">${GRADES.map(g => s.subs[g].join('/')).filter(Boolean).join('·')}</div></th>`)}</tr>
+        </thead>
+        <tbody>
+          ${shown.map(t => { const c = counts[t.name]; return html`<tr key=${t.name}>
+            <td className="sticky left-0 z-[5] bg-white border border-slate-300 px-2 py-0.5 whitespace-nowrap font-semibold">${t.name}${t.home && html`<span className="ml-1 text-[9px] text-slate-400 font-normal">${t.home}담임</span>`}</td>
+            ${S.map((s, i) => { const x = supCell(m, s, t.name), err = chk.cellErr[s.key] && chk.cellErr[s.key][t.name];
+              const tgt = { k: s.key, t: t.name }, can = !x.fixed && !!x.code;
+              return html`<td key=${s.key} data-cell=${`${s.key}|${t.name}`} title=${err || x.title || (x.same ? `같은 과목 시험: ${x.same.join(', ')} → 교실 감독 불가` : '')}
+                ...${can ? drag(tgt) : {}} ...${dnd(tgt)} onClick=${() => !x.fixed && clickCell(tgt)}
+                className=${`border border-slate-300 px-1 py-0.5 text-center whitespace-nowrap min-w-[58px] ${SUP_KIND_CLS[x.kind] || ''} ${dl(i)} ${can ? 'cursor-grab' : x.fixed ? 'cursor-not-allowed' : 'cursor-pointer'} ${err ? 'ring-2 ring-inset ring-rose-500 !bg-rose-50' : ''} ${isPick(s.key, t.name) ? 'ring-2 ring-inset ring-indigo-600 !bg-indigo-50' : ''}`}>${x.kind === 'H' ? x.short : x.text}${!x.code && !x.fixed && x.same ? html`<span className="text-[9px] text-slate-400">동</span>` : ''}</td>`; })}
+            <td className="border border-slate-300 text-center">${c.room}</td><td className="border border-slate-300 text-center">${c.cor || ''}</td><td className="border border-slate-300 text-center text-red-600">${c.stb || ''}</td>
+            <td className="border border-slate-300 text-center">${c.mock || ''}</td><td className="border border-slate-300 text-center">${c.prev || ''}</td><td className="border border-slate-300 text-center font-bold bg-amber-50" data-total=${t.name}>${c.total}</td>
+          </tr>`; })}
+          <tr className="bg-amber-50"><td className="sticky left-0 z-[5] bg-amber-100 border border-slate-300 px-2 font-bold text-amber-900">미배정</td>
+            ${S.map((s, i) => html`<td key=${s.key} ...${dnd({ k: s.key, zone: true })} onClick=${e => { if (e.target === e.currentTarget && pick && pick.t) clickCell({ k: s.key, zone: true }); }} data-unfilled=${s.key} className=${`border border-slate-300 p-0.5 align-top ${dl(i)}`}><div className="flex flex-col gap-0.5">
+              ${(chk.unfilled[s.key] || []).map(code => html`<span key=${code} ...${drag({ k: s.key, code })} onClick=${() => clickCell({ k: s.key, code })} data-chip=${`${s.key}|${code}`} className=${`px-1 rounded border text-[10px] cursor-grab whitespace-nowrap ${isPick(s.key, undefined, code) ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-amber-300 text-amber-900'}`}>${supText(code)}</span>`)}</div></td>`)}
+            <td colSpan="6" className="border border-slate-300 text-[10px] text-slate-500 px-2">교시별 남은 자리</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+
+  /* ---- 일자별 / 반별 미리보기 ---- */
+  const di = Math.min(dayI, Math.max(0, m.days.length - 1)), day = m.days[di];
+  const dayPick = html`<${Seg} value=${di} onChange=${setDayI} options=${m.days.map((d, i) => [i, d.sh])} size="xs" />`;
+  const pageView = kind => !day ? html`<p className="p-10 text-center text-slate-400">시험 시간표가 없습니다.</p>` : html`<div>
+    <div className="flex flex-wrap items-center gap-2 mb-2">${dayPick}
+      <button data-print=${`sup-${kind}`} onClick=${() => printPages([kind === 'day' ? supDayHTML(m, day, examTitle) : supClassHTML(m, day, examTitle)], 'a4')} className=${`${pbtn} bg-slate-800 text-white ml-auto`}>🖨 이 날 인쇄 (A4)</button>
+      <button onClick=${() => printPages(m.days.map(d => kind === 'day' ? supDayHTML(m, d, examTitle) : supClassHTML(m, d, examTitle)), 'a4')} className=${`${pbtn} bg-slate-600 text-white`}>🖨 모든 날 인쇄</button></div>
+    <${FitWidth} htmlStr=${kind === 'day' ? supDayHTML(m, day, examTitle, chk) : supClassHTML(m, day, examTitle)} designPx=${190 * MM} />
+  </div>`;
+
+  return html`<div className="space-y-3" id="supTab">${top}
+    ${view === 'list' && listView}${view === 'cond' && condView}${view === 'grid' && gridView}
+    ${view === 'day' && pageView('day')}${view === 'cls' && pageView('cls')}
+  </div>`;
+}
+
 /* --------------------------- 반별 결시 학생 현황 미리보기 --------------------------- */
 function AbsencePreview({ ab, setAb, ctx, classesByGrade, presentGrades, onExport, onExportRooms, roomMap, busy }) {
   const { selected } = ctx;
@@ -1812,10 +2889,158 @@ function ConfirmPreview({ cf, setCf, ctx, classesByGrade, presentGrades, onExpor
   </div>`;
 }
 
+const CODE_GS = "/**\n * 정기시험 응시현황 생성기 — 관리자 공동 작업 저장소 (스프레드시트에 붙는 Apps Script)\n *\n * 설치: 이 스프레드시트에서 [확장 프로그램 → Apps Script] → 기본 코드를 지우고 이 코드 전체 붙여넣기 → 저장\n *      → [배포 → 새 배포] → 유형: 웹 앱\n *         · 실행 계정: 나\n *         · 액세스 권한: 모든 사용자\n *      → 배포 → 권한 승인 → 표시된 '웹 앱 URL'(…/exec)을 프로그램의 [👥 공동 작업]에 붙여넣기\n *\n * 저장 위치: 이 스프레드시트가 있는 폴더 안 '공유작업_데이터' 폴더 (최근 20개 버전 보관)\n *           저장 기록은 이 스프레드시트의 '버전기록' 시트에 남습니다.\n * 보안: 데이터는 브라우저에서 팀 비밀번호로 암호화된 상태로만 저장됩니다.\n *       여기에는 암호문과 '누가·언제 저장했는지'만 남습니다.\n * 팀 비밀번호 초기화: 스프레드시트 메뉴 [공동 작업 → 팀 비밀번호 초기화]\n */\nvar DATA_FOLDER = '공유작업_데이터';\nvar LOG_SHEET = '버전기록';\nvar KEEP = 20;\n\n/* ---------- 웹 앱 ---------- */\nfunction doGet(e) { return handle_((e && e.parameter) || {}); }\nfunction doPost(e) {\n  var q = {};\n  try { q = JSON.parse(e.postData.contents); } catch (x) { q = {}; }\n  return handle_(q);\n}\n\n/* ---------- 스프레드시트 메뉴 ---------- */\nfunction onOpen() {\n  SpreadsheetApp.getUi().createMenu('공동 작업')\n    .addItem('현재 상태 보기', 'showStatus')\n    .addItem('팀 비밀번호 초기화', 'resetTeamPassword')\n    .addToUi();\n}\nfunction showStatus() {\n  var m = meta_();\n  SpreadsheetApp.getUi().alert('공동 작업 상태',\n    '팀 비밀번호: ' + (props_().getProperty('AUTH') ? '설정됨' : '아직 없음') +\n    '\\n최신 버전: v' + m.version + (m.savedBy ? ' (' + m.savedBy + ', ' + m.savedAt + ')' : ''),\n    SpreadsheetApp.getUi().ButtonSet.OK);\n}\nfunction resetTeamPassword() {\n  var ui = SpreadsheetApp.getUi();\n  var r = ui.alert('팀 비밀번호 초기화', '팀 비밀번호를 지우면 다음에 처음 연결하는 사람이 새 비밀번호를 정합니다.\\n기존에 저장된 데이터는 예전 비밀번호로만 열 수 있습니다.\\n계속할까요?', ui.ButtonSet.YES_NO);\n  if (r !== ui.Button.YES) return;\n  var p = props_();\n  p.deleteProperty('AUTH'); p.deleteProperty('VERSION'); p.deleteProperty('SAVED_BY'); p.deleteProperty('SAVED_AT'); p.deleteProperty('FILE_ID');\n  log_(['초기화', now_(), '', '', '팀 비밀번호와 버전 번호를 초기화함']);\n  ui.alert('초기화했습니다.');\n}\n\n/* ---------- 내부 ---------- */\nfunction out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }\nfunction props_() { return PropertiesService.getScriptProperties(); }\nfunction ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }\nfunction folder_() {\n  var parents = DriveApp.getFileById(ss_().getId()).getParents();\n  var base = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();\n  var it = base.getFoldersByName(DATA_FOLDER);\n  return it.hasNext() ? it.next() : base.createFolder(DATA_FOLDER);\n}\nfunction log_(row) {\n  var ss = ss_();\n  var sh = ss.getSheetByName(LOG_SHEET);\n  if (!sh) sh = ss.insertSheet(LOG_SHEET);\n  if (sh.getLastRow() === 0) sh.appendRow(['버전', '저장 시각', '저장한 사람', '크기(KB)', '파일 ID']);\n  sh.appendRow(row);\n}\nfunction meta_() {\n  var p = props_();\n  return {\n    version: Number(p.getProperty('VERSION') || 0),\n    savedBy: p.getProperty('SAVED_BY') || '',\n    savedAt: p.getProperty('SAVED_AT') || '',\n    fileId: p.getProperty('FILE_ID') || ''\n  };\n}\nfunction pub_(m, extra) {\n  var o = { ok: true, version: m.version, savedBy: m.savedBy, savedAt: m.savedAt };\n  for (var k in (extra || {})) o[k] = extra[k];\n  return o;\n}\nfunction now_() { return Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH:mm:ss'); }\n\nfunction handle_(q) {\n  try {\n    var p = props_();\n    var auth = p.getProperty('AUTH');\n    if (q.action === 'ping') return out_(pub_(meta_(), { initialized: !!auth }));\n    if (!auth) {\n      if (q.action === 'init' && q.auth) { p.setProperty('AUTH', String(q.auth)); log_(['시작', now_(), String(q.savedBy || ''), '', '팀 비밀번호 설정']); return out_(pub_(meta_(), { initialized: true })); }\n      return out_({ ok: false, error: 'NOT_INITIALIZED' });\n    }\n    if (String(q.auth || '') !== auth) return out_({ ok: false, error: 'BAD_AUTH' });\n    var m = meta_();\n\n    if (q.action === 'meta') return out_(pub_(m));\n\n    if (q.action === 'load') {\n      var id = q.fileId || m.fileId;\n      if (!id) return out_(pub_(m, { empty: true }));\n      var f = DriveApp.getFileById(id);\n      if (!inFolder_(f)) return out_({ ok: false, error: 'NOT_FOUND' });\n      return out_(pub_(m, { data: f.getBlob().getDataAsString(), loadedName: f.getName() }));\n    }\n\n    if (q.action === 'save') {\n      var lock = LockService.getScriptLock();\n      lock.waitLock(20000);\n      try {\n        var cur = meta_();\n        if (!q.force && Number(q.baseVersion) !== cur.version) return out_({ ok: false, error: 'CONFLICT', version: cur.version, savedBy: cur.savedBy, savedAt: cur.savedAt });\n        var v = cur.version + 1;\n        var at = now_();\n        var name = 'v' + ('00000' + v).slice(-5) + '_' + Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyyMMdd_HHmmss') + '.json';\n        var data = String(q.data || '');\n        var file = folder_().createFile(name, data, 'application/json');\n        file.setDescription(String(q.savedBy || ''));\n        p.setProperties({ VERSION: String(v), SAVED_BY: String(q.savedBy || ''), SAVED_AT: at, FILE_ID: file.getId() });\n        log_(['v' + v, at, String(q.savedBy || ''), Math.round(data.length / 1024), file.getId()]);\n        prune_();\n        return out_(pub_(meta_()));\n      } finally { lock.releaseLock(); }\n    }\n\n    // 관리자 화면 [설정 초기화]: 저장된 모든 버전·버전 기록·팀 비밀번호를 지운다 (팀 비밀번호 확인 후)\n    if (q.action === 'reset') {\n      var lk = LockService.getScriptLock();\n      lk.waitLock(20000);\n      try {\n        var n = 0, fit = folder_().getFiles();\n        while (fit.hasNext()) { var df = fit.next(); if (/^v\\d+_/.test(df.getName())) { df.setTrashed(true); n++; } }\n        ['AUTH', 'VERSION', 'SAVED_BY', 'SAVED_AT', 'FILE_ID'].forEach(function (k) { p.deleteProperty(k); });\n        var sh = ss_().getSheetByName(LOG_SHEET);\n        if (sh) sh.clear();\n        log_(['초기화', now_(), String(q.savedBy || ''), '', '관리자 화면에서 전체 초기화 (버전 ' + n + '개 삭제)']);\n        return out_({ ok: true, reset: true, removed: n });\n      } finally { lk.releaseLock(); }\n    }\n\n    if (q.action === 'history') {\n      var list = [];\n      var it = folder_().getFiles();\n      while (it.hasNext()) {\n        var x = it.next();\n        if (!/^v\\d+_/.test(x.getName())) continue;\n        list.push({ id: x.getId(), name: x.getName(), by: x.getDescription() || '', size: x.getSize(), at: Utilities.formatDate(x.getDateCreated(), 'Asia/Seoul', 'yyyy-MM-dd HH:mm:ss') });\n      }\n      list.sort(function (a, b) { return b.name < a.name ? -1 : b.name > a.name ? 1 : 0; });\n      return out_(pub_(m, { files: list.slice(0, KEEP) }));\n    }\n    return out_({ ok: false, error: 'UNKNOWN_ACTION' });\n  } catch (err) {\n    return out_({ ok: false, error: String(err && err.message || err) });\n  }\n}\n\nfunction inFolder_(f) {\n  var target = folder_().getId();\n  var ps = f.getParents();\n  while (ps.hasNext()) if (ps.next().getId() === target) return true;\n  return false;\n}\nfunction prune_() {\n  var files = [];\n  var it = folder_().getFiles();\n  while (it.hasNext()) { var f = it.next(); if (/^v\\d+_/.test(f.getName())) files.push(f); }\n  files.sort(function (a, b) { return b.getName() < a.getName() ? -1 : 1; });\n  files.slice(KEEP).forEach(function (f) { f.setTrashed(true); });\n}\n";
+/* ======================== 관리자 공동 작업 (구글 Apps Script) ========================
+ * 작업 상태를 팀 비밀번호로 암호화해 구글 드라이브(Apps Script 웹 앱)에 저장하고,
+ * 여러 관리자가 같은 상태를 자동으로 주고받는다. 버전 번호로 동시 저장 충돌을 막는다. */
+const SYNC_KEY = 'exam_sync_v1';
+const SYNC_SHEET_URL = 'https://docs.google.com/spreadsheets/d/10eQUSIKaUPT11tEVOYhhAAQCQpnjsQapakH8jhYQi5c/edit';
+const SYNC_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbyt6mRh4XWdaxv2yezVHVtojJLdM7HxIMmHF3w8WB8kFb2lqrzr6OheyGZeH71sP7Adug/exec'; // 학교 공동 작업 저장소 (기본값)
+const SYNC_DEFAULT = { url: SYNC_WEBAPP_URL, name: '', pw: '', remember: true, auto: true, syncedVersion: 0, localDirty: false };
+const loadSync = () => { try { const s = { ...SYNC_DEFAULT, ...JSON.parse(safeStorage.get(SYNC_KEY) || '{}') }; if (!s.url) s.url = SYNC_WEBAPP_URL; return s; } catch (e) { return { ...SYNC_DEFAULT }; } };
+const storeSync = s => safeStorage.set(SYNC_KEY, JSON.stringify({ ...s, pw: s.remember ? s.pw : '' }));
+const syncAuth = pw => sha256Hex('exam-sync-auth:' + pw);
+const SYNC_POLL_MS = () => window.__SYNC_POLL_MS || 30000;
+const SYNC_AUTOSAVE_MS = () => window.__SYNC_AUTOSAVE_MS || 15000;
+const syncErrText = e => ({
+  BAD_AUTH: '팀 비밀번호가 다릅니다.',
+  NOT_INITIALIZED: '공유 공간이 아직 없거나 초기화되었습니다. [공동 작업]에서 다시 연결해 시작하세요.',
+  NOT_FOUND: '해당 버전을 찾을 수 없습니다.',
+  UNKNOWN_ACTION: 'Apps Script 코드가 최신이 아닙니다. Code.gs를 다시 붙여넣고 새 버전으로 배포하세요.',
+}[e] || e || '알 수 없는 오류');
+async function syncCall(url, body) {
+  let r;
+  try { r = await fetch(url.trim(), { method: 'POST', body: JSON.stringify(body), redirect: 'follow', cache: 'no-store' }); }
+  catch (e) { throw new Error('웹 앱 주소에 접속할 수 없습니다. 주소(…/exec)와 배포 설정(액세스 권한: 모든 사용자)을 확인하세요.'); }
+  if (!r.ok) throw new Error(`서버 응답 오류 (${r.status})`);
+  try { return await r.json(); } catch (e) { throw new Error('웹 앱 응답을 읽을 수 없습니다. 배포 액세스 권한이 "모든 사용자"인지 확인하세요.'); }
+}
+
+function SyncDialog({ onClose, conf, sync, actions, busyFlag }) {
+  const [f, setF] = useState({ url: conf.url, name: conf.name, pw: conf.pw, remember: conf.remember, auto: conf.auto });
+  const [step, setStep] = useState(null); // 'needInit'
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [hist, setHist] = useState(null);
+  const [guide, setGuide] = useState(!conf.url);
+  const [copied, setCopied] = useState(false);
+  const set = o => setF(x => ({ ...x, ...o }));
+  const connected = sync.connected;
+  const inp = 'w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm';
+  const lab = 'block text-[11px] font-semibold text-slate-600 mb-1';
+  const run = async fn => { setBusy(true); setErr(''); try { await fn(); } catch (e) { setErr(e.message); } finally { setBusy(false); } };
+  const doConnect = init => run(async () => {
+    if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(f.url.trim())) throw new Error('구글 Apps Script 웹 앱 주소(https://script.google.com/macros/s/…/exec)를 붙여넣으세요.');
+    if (f.pw.length < 6) throw new Error('팀 비밀번호는 6자 이상으로 정하세요.');
+    if (!f.name.trim()) throw new Error('내 이름을 입력하세요. (누가 저장했는지 표시됩니다)');
+    const r = await actions.connect({ ...f, url: f.url.trim(), name: f.name.trim() }, { init });
+    if (r && r.needInit) { setStep('needInit'); return; }
+    setStep(null);
+  });
+  const copyCode = async () => { try { await navigator.clipboard.writeText(CODE_GS); } catch (e) { /* 아래 다운로드 사용 */ } setCopied(true); setTimeout(() => setCopied(false), 1500); };
+  const downloadCode = () => { const b = new Blob([CODE_GS], { type: 'application/octet-stream' }); const u = URL.createObjectURL(b), a = document.createElement('a'); a.href = u; a.download = 'Code.gs'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 1000); };
+  const st = sync.remote;
+  return html`<div className="fixed inset-0 z-50 bg-slate-900/60 flex items-start justify-center p-4 overflow-auto" onClick=${e => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mt-8 p-6" role="dialog" aria-label="공동 작업">
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-black">👥 관리자 공동 작업</h2>
+        <button onClick=${onClose} disabled=${busy} className="text-slate-400 hover:text-slate-700 text-xl">×</button>
+      </div>
+      <p className="text-xs text-slate-500 mb-4">여러 선생님이 같은 작업 상태(명단·시간표·설정·통계 입력값)를 자동으로 주고받습니다. 데이터는 팀 비밀번호로 암호화되어 구글 드라이브에 저장됩니다.</p>
+
+      ${connected && html`<div className="rounded-xl border-2 border-emerald-300 bg-emerald-50/60 p-4 mb-3" id="syncConnected">
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <span className="text-sm font-bold text-emerald-900">✅ 연결됨</span>
+          <span className="text-xs text-slate-600">내 이름 <b>${conf.name}</b> · 내 화면 버전 v${conf.syncedVersion}${st ? ` · 공유 최신 v${st.version}${st.savedBy ? ` (${st.savedBy}, ${st.savedAt})` : ''}` : ''}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button id="syncSaveNow" disabled=${busy || busyFlag} onClick=${() => run(() => actions.save(false))} className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-bold disabled:opacity-50">☁ 지금 저장</button>
+          <button id="syncLoadNow" disabled=${busy} onClick=${() => run(() => actions.loadLatest())} className="px-3 py-1.5 rounded-lg border border-emerald-400 text-emerald-800 text-xs font-bold bg-white">⬇ 최신본 불러오기</button>
+          <button id="syncHist" disabled=${busy} onClick=${() => run(async () => setHist(await actions.history()))} className="px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 text-xs font-semibold bg-white">🕘 버전 기록</button>
+          <label className="flex items-center gap-1.5 text-xs text-slate-700 ml-2"><input type="checkbox" id="syncAuto" checked=${conf.auto} onChange=${e => actions.setAuto(e.target.checked)} /> 자동 저장 (변경 후 15초)</label>
+          <button id="syncOff" onClick=${() => { if (confirm('이 브라우저에서 공동 작업 연결을 끊을까요? (공유된 데이터는 지워지지 않습니다)')) { actions.disconnect(); onClose(); } }} className="ml-auto px-3 py-1.5 rounded-lg text-xs text-rose-600 hover:bg-rose-50">연결 해제</button>
+        </div>
+        ${hist && html`<div className="mt-3 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-white" id="syncHistList">
+          ${hist.length === 0 ? html`<p className="p-3 text-xs text-slate-400">기록이 없습니다.</p>` : hist.map((h, i) => html`<div key=${h.id} className="flex items-center gap-2 px-3 py-1.5 text-xs border-b border-slate-100 last:border-0">
+            <b className="w-14">${h.name.slice(0, 6).replace(/^v0*/, 'v')}</b><span className="text-slate-600">${h.at}</span><span className="text-slate-500">${h.by || '-'}</span><span className="text-slate-400">${Math.round(h.size / 1024)}KB</span>
+            ${i === 0 ? html`<span className="ml-auto text-emerald-700 font-semibold">현재</span>` : html`<button data-restore=${h.id} disabled=${busy} onClick=${() => { if (confirm(`${h.at} (${h.by || '-'}) 버전으로 되돌릴까요?\n되돌린 내용이 새 버전으로 저장되어 모두에게 반영됩니다.`)) run(async () => { await actions.restore(h.id); setHist(await actions.history()); }); }} className="ml-auto px-2 py-0.5 rounded border border-slate-300 hover:bg-slate-50">이 버전으로 되돌리기</button>`}
+          </div>`)}</div>`}
+      </div>`}
+
+      <div className="rounded-xl border border-slate-200 p-4 mb-3">
+        <div className="text-sm font-bold mb-2">${connected ? '연결 설정' : '① 연결하기'}</div>
+        <div className="grid grid-cols-2 gap-2">
+          <div className="col-span-2"><label className=${lab}>Apps Script 웹 앱 주소</label><input id="syncUrl" value=${f.url} onInput=${e => set({ url: e.target.value })} placeholder="https://script.google.com/macros/s/…/exec" className=${inp} /></div>
+          <div><label className=${lab}>팀 비밀번호 (6자 이상, 함께 쓰는 선생님과 동일)</label><input id="syncPw" type="password" autoComplete="off" value=${f.pw} onInput=${e => set({ pw: e.target.value })} className=${inp} /></div>
+          <div><label className=${lab}>내 이름 (저장한 사람 표시)</label><input id="syncName" value=${f.name} onInput=${e => set({ name: e.target.value })} placeholder="예: 홍길동" className=${inp} /></div>
+          <label className="col-span-2 flex items-center gap-1.5 text-[11px] text-slate-600"><input type="checkbox" checked=${f.remember} onChange=${e => set({ remember: e.target.checked })} /> 이 PC 브라우저에 팀 비밀번호 기억 (열 때 자동 연결 · 공용 PC에서는 끄세요)</label>
+        </div>
+        ${step === 'needInit' ? html`<div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 p-3 text-xs text-amber-900">
+            공유 공간이 비어 있습니다. <b>이 팀 비밀번호로 공유를 시작</b>하고, 지금 내 화면의 작업 상태를 첫 버전으로 올릴까요?
+            <div className="mt-2"><button id="syncInit" disabled=${busy} onClick=${() => doConnect(true)} className="px-3 py-1.5 rounded-lg bg-amber-500 text-slate-900 font-bold disabled:opacity-50">이 비밀번호로 공유 시작</button></div></div>`
+          : html`<div className="mt-3 flex justify-end"><button id="syncConnect" disabled=${busy} onClick=${() => doConnect(false)} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-bold disabled:opacity-50">${busy ? '연결 중…' : connected ? '다시 연결' : '연결'}</button></div>`}
+      </div>
+
+      ${err && html`<p id="syncErr" className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2.5 mb-3">${err}</p>`}
+
+      <div className="rounded-xl border border-slate-200">
+        <button onClick=${() => setGuide(v => !v)} className="w-full flex items-center justify-between px-4 py-2.5 text-left"><span className="text-sm font-bold">처음 한 번만: 공유 저장소 만들기 (구글 Apps Script)</span><span className="text-xs text-slate-400">${guide ? '접기 ▲' : '열기 ▼'}</span></button>
+        ${guide && html`<div className="px-4 pb-4 text-xs text-slate-700 space-y-1.5">
+          <ol className="list-decimal pl-5 space-y-1.5">
+            <li>구글 드라이브 '정기시험 응시현황' 폴더의 <b>공동작업 스프레드시트</b>를 엽니다. (<a className="text-indigo-600 underline" href=${SYNC_SHEET_URL} target="_blank" rel="noopener">바로 열기</a>)</li>
+            <li>메뉴 <b>확장 프로그램 → Apps Script</b> → 기본 코드를 모두 지우고 아래 <b>Code.gs</b> 내용을 붙여넣은 뒤 저장(💾)</li>
+            <li>오른쪽 위 <b>배포 → 새 배포</b> → 톱니바퀴에서 <b>웹 앱</b> 선택 → 실행 계정 <b>나</b>, 액세스 권한 <b>모든 사용자</b> → <b>배포</b></li>
+            <li>권한 승인 창에서 계정 선택 → (경고가 나오면) <b>고급 → 프로젝트로 이동 → 허용</b></li>
+            <li>표시된 <b>웹 앱 URL</b>(…/exec)을 복사해 위 주소 칸에 붙여넣고, 팀 비밀번호·내 이름을 넣어 <b>연결</b> → [이 비밀번호로 공유 시작]</li>
+            <li>함께 작업할 선생님께 <b>관리자 페이지 주소, 웹 앱 URL, 팀 비밀번호</b>를 알려 주세요.</li>
+          </ol>
+          <div className="flex gap-2 pt-1">
+            <button id="copyGs" onClick=${copyCode} className="px-3 py-1.5 rounded-lg bg-slate-800 text-white font-semibold">${copied ? '복사됨' : '📋 Code.gs 복사'}</button>
+            <button onClick=${downloadCode} className="px-3 py-1.5 rounded-lg border border-slate-300 font-semibold">⬇ Code.gs 내려받기</button>
+          </div>
+          <p className="text-slate-500">· 데이터는 스프레드시트와 같은 폴더의 '공유작업_데이터' 폴더에 최근 20개 버전이 암호문으로 보관되고, 저장 기록은 스프레드시트 '버전기록' 시트에 남습니다. · 팀 비밀번호를 잊으면 스프레드시트 메뉴 [공동 작업 → 팀 비밀번호 초기화] 후 다시 시작하세요(기존 데이터는 열 수 없게 됩니다). · 코드를 고친 뒤에는 [배포 → 배포 관리 → 수정 → 버전: 새 버전]으로 다시 배포해야 반영됩니다.</p>
+        </div>`}
+      </div>
+    </div>
+  </div>`;
+}
+
 /* ---------------------- 설정 파일 내보내기 / 불러오기 (관리자) ----------------------
  * 작업 상태 전체(명단 원본·시간표·과목코드·통/선·이동반·학급 선택·기준·시간·출제자·고사실 구성·시험명)를
  * .json 파일 하나로 저장했다가 다른 PC·브라우저에서 그대로 불러온다. 비밀번호를 넣으면 암호화. */
 const CFG_APP = 'exam-generator-config';
+/* ---------- 설정 초기화: 관리자 비밀번호 재확인 + 공유 데이터까지 ---------- */
+function ResetDialog({ onClose, connected, syncConf, onReset }) {
+  const [pw, setPw] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [sharedFail, setSharedFail] = useState(false);
+  const run = async localOnly => {
+    setBusy(true); setErr('');
+    try { await onReset(pw, localOnly); onClose(); }
+    catch (e) { setErr(e.message); setSharedFail(!!e.shared); if (!e.shared) setPw(''); }
+    finally { setBusy(false); }
+  };
+  return html`<div className="fixed inset-0 z-50 bg-slate-900/60 flex items-start justify-center p-4 overflow-auto" onClick=${e => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+    <form onSubmit=${e => { e.preventDefault(); if (pw && !busy) run(false); }} className="bg-white rounded-2xl shadow-2xl w-full max-w-md mt-16 p-6" role="dialog" aria-label="설정 초기화">
+      <div className="flex items-center justify-between mb-2"><h2 className="text-lg font-black text-rose-700">🔄 설정 초기화</h2>
+        <button type="button" onClick=${onClose} disabled=${busy} className="text-slate-400 hover:text-slate-700 text-xl">×</button></div>
+      <div className="text-sm text-slate-700 space-y-1.5 mb-3">
+        <p>명단·시간표·통계 설정·감독 시간표 등 <b>모든 작업 내용</b>을 지우고 샘플 상태로 되돌립니다. <b className="text-rose-600">되돌릴 수 없습니다.</b></p>
+        ${connected ? html`<p className="rounded-lg bg-rose-50 border border-rose-200 px-3 py-2 text-[13px] text-rose-800" id="resetShared">☁ 공동 작업에 연결되어 있어 <b>구글 시트의 공유 데이터도 함께</b> 지웁니다. (저장된 모든 버전, 버전 기록, 팀 비밀번호) 다른 관리자 화면도 연결이 끊어지며, 다음에 처음 연결하는 사람이 새로 시작합니다.</p>`
+          : html`<p className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-[13px] text-slate-600">${syncConf && syncConf.url ? '공동 작업에 연결되어 있지 않아 구글 시트 내용은 지우지 않습니다. 함께 지우려면 먼저 [👥 공동 작업]에 연결한 뒤 초기화하세요.' : '이 브라우저에 저장된 내용만 지웁니다.'}</p>`}
+      </div>
+      <label className="text-xs font-semibold text-slate-600">관리자 비밀번호를 한 번 더 입력하세요
+        <input id="resetPw" type="password" inputMode="numeric" autoFocus value=${pw} onInput=${e => { setPw(e.target.value); setErr(''); setSharedFail(false); }} className="mt-1 w-full border border-slate-300 rounded-lg px-3 py-2 text-base font-normal" /></label>
+      ${err && html`<p id="resetErr" className="text-sm text-rose-600 mt-2">${err}</p>`}
+      <div className="flex flex-wrap justify-end gap-2 mt-4">
+        ${sharedFail && html`<button type="button" id="resetLocal" disabled=${busy} onClick=${() => run(true)} className="px-3 py-2 rounded-lg border border-slate-300 text-sm">이 브라우저만 초기화</button>`}
+        <button type="button" onClick=${onClose} disabled=${busy} className="px-3 py-2 rounded-lg border border-slate-300 text-sm">취소</button>
+        <button id="resetGo" type="submit" disabled=${!pw || busy} className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-bold text-sm">${busy ? '초기화 중…' : connected ? '공유 데이터까지 초기화' : '초기화'}</button>
+      </div>
+    </form>
+  </div>`;
+}
 function ConfigFileDialog({ onClose, buildConfig, applyConfig, say }) {
   const [pw, setPw] = useState('');
   const [pw2, setPw2] = useState('');
@@ -1914,8 +3139,8 @@ function ShareDialog({ onClose, makePayload, say }) {
   const [copied, setCopied] = useState(false);
   const [showGh, setShowGh] = useState(() => !loadGh().token);
   const set = o => setGh(g => ({ ...g, ...o }));
-  const pwErr = !pw ? '' : pw.length < 6 ? '6자 이상으로 정하세요.' : pw !== pw2 ? '두 비밀번호가 다릅니다.' : '';
-  const pwOk = pw.length >= 6 && pw === pw2;
+  const pwErr = !pw ? '' : pw.length < 4 ? '4자 이상으로 정하세요.' : pw !== pw2 ? '두 비밀번호가 다릅니다.' : '';
+  const pwOk = pw.length >= 4 && pw === pw2;
   const ghOk = gh.owner.trim() && gh.repo.trim() && gh.branch.trim() && gh.path.trim() && gh.token.trim();
 
   const build = async () => {
@@ -1977,7 +3202,7 @@ function ShareDialog({ onClose, makePayload, say }) {
         <div className="text-sm font-bold mb-1">① 열람 비밀번호</div>
         <p className="text-[11px] text-slate-500 mb-2">파일 속 학생 명단을 이 비밀번호로 암호화합니다. 링크를 연 사람은 비밀번호를 넣어야 내용을 볼 수 있습니다. 비밀번호는 어디에도 저장되지 않으니 잊지 않게 기록해 두세요.</p>
         <div className="grid grid-cols-2 gap-2">
-          <div><label className=${lab}>비밀번호 (6자 이상)</label><input id="sharePw" type="password" autoComplete="new-password" value=${pw} onInput=${e => setPw(e.target.value)} className=${inp} /></div>
+          <div><label className=${lab}>비밀번호 (4자 이상)</label><input id="sharePw" type="password" autoComplete="new-password" value=${pw} onInput=${e => setPw(e.target.value)} className=${inp} /></div>
           <div><label className=${lab}>비밀번호 확인</label><input id="sharePw2" type="password" autoComplete="new-password" value=${pw2} onInput=${e => setPw2(e.target.value)} className=${inp} /></div>
         </div>
         ${pwErr && html`<p className="text-[11px] text-rose-600 mt-1">${pwErr}</p>`}
