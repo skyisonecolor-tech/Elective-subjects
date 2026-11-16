@@ -1298,10 +1298,17 @@ const SUP_CSS = `
 .sup td.yl{background:#FFFF00}
 .sup .note{white-space:pre-wrap;padding:3pt 4pt;line-height:1.5;font-size:7.5pt}
 .sup .z{color:#bbb}.sup .full{width:100%}
+.sup.fit>.wrap>table tr,.sup.fit>table tr{height:var(--rh)}.sup.fit>.wrap>table{width:56%}.sup.fit .ttl{font-size:16pt;margin-bottom:3mm}.sup.fit th,.sup.fit td{height:auto}
 .sup .cnt td{font-weight:700}.sup td.tot{background:#FFF7D6;font-weight:800}
 .sup .sub{font-size:6.5pt;font-weight:400;color:#333;white-space:normal;line-height:1.1}
 `;
 const supCls = c => (c.kind ? `c${c.kind}` : '');
+// A4 세로 한 장의 약 90%를 채우도록 행 높이·글씨 크기를 정한다 (표 행 수 기준)
+function supA4Fit(nRows) {
+  const rowMM = Math.max(3.6, Math.min(9, 246 / Math.max(1, nRows)));
+  const fs = Math.max(7.5, Math.min(12, rowMM * 2.835 * 0.56));
+  return `--rh:${rowMM.toFixed(2)}mm;font-size:${fs.toFixed(1)}pt`;
+}
 function supDayHTML(m, day, examTitle, chk) {
   const S = day.slots;
   const head = `<tr><th rowspan="2">번호</th><th rowspan="2">성명</th><th rowspan="2">담임반</th><th rowspan="2" class="mvh">이동반</th>${S.map(s => `<th class="ph">${s.p}교시</th>`).join('')}</tr><tr>${S.map(s => `<th class="ph" style="font-weight:400;font-size:6.5pt">${esc(s.time) || '감독'}</th>`).join('')}</tr>`;
@@ -1315,7 +1322,7 @@ function supDayHTML(m, day, examTitle, chk) {
   const nW = +m.sup.standby || 0;
   const stbb = nW ? `<div class="box"><div class="bh">대기 감독 (교무실)</div><table><tbody>${S.map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(Array.from({ length: nW }, (_, k) => { const n = who(s, c => c.code === `W|${k + 1}`)[0]; return n ? `${k + 1}. ${n}` : ''; }).filter(Boolean).join('  ') || '-')}</td></tr>`).join('')}</tbody></table></div>` : '';
   const note = `<div class="box note">${esc(m.sup.note || '')}\n\n<b>&lt;기호 표시&gt;</b> ♣ 출제 교과 시험(고사본부 대기) · <span style="background:#CDF2E4">복도</span> · <span style="color:#E00000;font-weight:800">대기</span> · <span style="background:#FFE7D8">관리·제외</span> · (정) 정감독 (부) 부감독</div>`;
-  return `<div class="sup"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 감독표</div><div class="wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table><div class="right">${ttb}${hqb}${corb}${stbb}${note}</div></div></div>`;
+  return `<div class="sup fit" style="${supA4Fit(m.teachers.length + 2)}"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 감독표</div><div class="wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table><div class="right">${ttb}${hqb}${corb}${stbb}${note}</div></div></div>`;
 }
 function supClassHTML(m, day, examTitle) {
   const S = day.slots;
@@ -1336,7 +1343,7 @@ function supClassHTML(m, day, examTitle) {
   (m.sup.posts || []).filter(p => p.name).forEach((p, i) => rows.push(`<tr>${i === 0 ? `<td rowspan="${(m.sup.posts || []).filter(x => x.name).length}" class="lb cC">복도</td>` : ''}<td class="lb cC">${esc(p.name)}</td>${S.map(s => `<td colspan="2">${esc(nameOf(s, `C|${p.name}`))}</td>`).join('')}</tr>`));
   if (+m.sup.standby) rows.push(`<tr><td colspan="2" class="lb">대기</td>${S.map(s => `<td colspan="2" class="cW">${esc(Array.from({ length: +m.sup.standby }, (_, k) => nameOf(s, `W|${k + 1}`)).filter(Boolean).join(', '))}</td>`).join('')}</tr>`);
   rows.push(`<tr><td colspan="2" class="lb cH">본부 ♣</td>${S.map(s => `<td colspan="2" style="white-space:normal">${esc(m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '))}</td>`).join('')}</tr>`);
-  return `<div class="sup"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 반별 감독표</div><table class="full"><thead>${head}</thead><tbody>${rows.join('')}</tbody></table></div>`;
+  return `<div class="sup fit" style="${supA4Fit(rows.length + 2)}"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 반별 감독표</div><table class="full"><thead>${head}</thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
 function supTeacherHTML(m, examTitle, counts, chk) {
   const S = m.slots;
@@ -1364,6 +1371,18 @@ function buildSupWorkbook(m, examTitle, counts) {
   const kindFill = { C: 'FFCDF2E4', H: 'FF42C7F1', X: 'FFFFE7D8', L: 'FFF1F5F9' };
   const codeCell = (cell, r, c, x) => cell(r, c, x.text, { fill: kindFill[x.kind], bold: x.kind === 'W' || x.kind === 'H', color: x.kind === 'W' ? 'FFE00000' : x.kind === 'L' ? 'FF94A3B8' : undefined });
   const sheetName = s => s.replace(/[\\\/\?\*\[\]:]/g, '').slice(0, 31);
+  // A4 세로 인쇄 영역의 약 90%를 채우도록 행 높이·열 너비·글씨를 키우거나 줄인다 (제목 1행 제외)
+  const fitA4 = (ws, lastRow, lastCol) => {
+    const W = 524, H = 752 - (ws.getRow(1).height || 30.75), n = lastRow - 1;
+    const h = Math.max(12, Math.min(40, H / n)), f = Math.max(0.9, Math.min(1.45, h / 16.4));
+    for (let r = 2; r <= lastRow; r++) {
+      ws.getRow(r).height = h;
+      for (let c = 1; c <= lastCol; c++) { const x = ws.getCell(r, c); if (x.font && x.font.size) x.font = { ...x.font, size: Math.round(x.font.size * f * 2) / 2 }; }
+    }
+    const pt = Array.from({ length: lastCol }, (_, i) => (Math.trunc((ws.getColumn(i + 1).width || 9) * 7 + 5)) * 0.75);
+    const k = W / pt.reduce((a, b) => a + b, 0);
+    pt.forEach((v, i) => { ws.getColumn(i + 1).width = Math.max(1, Math.round(((v * k) / 0.75 - 5) / 7 * 10) / 10); });
+  };
   // 1) 일자별 전체 감독표
   m.days.forEach(day => {
     const S = day.slots, nP = S.length;
@@ -1407,6 +1426,7 @@ function buildSupWorkbook(m, examTitle, counts) {
     S.forEach((_, j) => { ws.getColumn(5 + j).width = 11.5; });
     ws.getColumn(R0 - 1).width = 1.8; ws.getColumn(R0).width = 6; ws.getColumn(R0 + 1).width = 12.8;
     GRADES.forEach((_, k) => { ws.getColumn(R0 + 2 + k).width = 12; });
+    fitA4(ws, lastRow, lastCol);
   });
   // 2) 일자별 반별 감독표
   m.days.forEach(day => {
@@ -1441,6 +1461,7 @@ function buildSupWorkbook(m, examTitle, counts) {
     S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '), { size: 8 }); cell(r, col + 1, null); });
     for (let k = 2; k <= r; k++) ws.getRow(k).height = 16.4;
     ws.getColumn(1).width = 7; ws.getColumn(2).width = 9; S.forEach((_, j) => { ws.getColumn(3 + j * 2).width = 12; ws.getColumn(4 + j * 2).width = 12; });
+    fitA4(ws, r, last);
   });
   // 3) 교사(전체) — 결재용 · 다음 시험 때 '이전 감독 횟수'로 불러올 수 있음
   const ws = wb.addWorksheet('교사(전체)', page({ }));
@@ -1553,7 +1574,7 @@ function hwpxTable(ws, st, ids, opt) {
   const rows = []; for (let r = R0 + 1; r <= nR; r++) rows.push(r);
   const rowPt = r => ws.getRow(r).height || 15;
   const totalH = rows.reduce((a, r) => a + rowPt(r) * 100, 0);
-  const s = Math.max(0.62, Math.min(1, opt.height / totalH)), fs = Math.max(0.78, Math.min(1, s + 0.1));
+  const s = Math.max(0.62, Math.min(1.3, opt.height * 0.97 / totalH)), fs = Math.max(0.78, Math.min(1.15, s < 1 ? s + 0.1 : s));
   const rowH = r => Math.round(rowPt(r) * 100 * s);
   const hex = argb => (argb && /^[0-9A-F]{8}$/i.test(argb) ? `#${argb.slice(2)}` : null);
   const trs = rows.map((r, ri) => {
