@@ -2931,7 +2931,7 @@ function SyncDialog({ onClose, conf, sync, actions, busyFlag }) {
   const run = async fn => { setBusy(true); setErr(''); try { await fn(); } catch (e) { setErr(e.message); } finally { setBusy(false); } };
   const doConnect = init => run(async () => {
     if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(f.url.trim())) throw new Error('구글 Apps Script 웹 앱 주소(https://script.google.com/macros/s/…/exec)를 붙여넣으세요.');
-    if (f.pw.length < 6) throw new Error('팀 비밀번호는 6자 이상으로 정하세요.');
+    if (f.pw.length < 4) throw new Error('팀 비밀번호는 4자 이상으로 정하세요.');
     if (!f.name.trim()) throw new Error('내 이름을 입력하세요. (누가 저장했는지 표시됩니다)');
     const r = await actions.connect({ ...f, url: f.url.trim(), name: f.name.trim() }, { init });
     if (r && r.needInit) { setStep('needInit'); return; }
@@ -2971,7 +2971,7 @@ function SyncDialog({ onClose, conf, sync, actions, busyFlag }) {
         <div className="text-sm font-bold mb-2">${connected ? '연결 설정' : '① 연결하기'}</div>
         <div className="grid grid-cols-2 gap-2">
           <div className="col-span-2"><label className=${lab}>Apps Script 웹 앱 주소</label><input id="syncUrl" value=${f.url} onInput=${e => set({ url: e.target.value })} placeholder="https://script.google.com/macros/s/…/exec" className=${inp} /></div>
-          <div><label className=${lab}>팀 비밀번호 (6자 이상, 함께 쓰는 선생님과 동일)</label><input id="syncPw" type="password" autoComplete="off" value=${f.pw} onInput=${e => set({ pw: e.target.value })} className=${inp} /></div>
+          <div><label className=${lab}>팀 비밀번호 (4자 이상, 함께 쓰는 선생님과 동일)</label><input id="syncPw" type="password" autoComplete="off" value=${f.pw} onInput=${e => set({ pw: e.target.value })} className=${inp} /></div>
           <div><label className=${lab}>내 이름 (저장한 사람 표시)</label><input id="syncName" value=${f.name} onInput=${e => set({ name: e.target.value })} placeholder="예: 홍길동" className=${inp} /></div>
           <label className="col-span-2 flex items-center gap-1.5 text-[11px] text-slate-600"><input type="checkbox" checked=${f.remember} onChange=${e => set({ remember: e.target.checked })} /> 이 PC 브라우저에 팀 비밀번호 기억 (열 때 자동 연결 · 공용 PC에서는 끄세요)</label>
         </div>
