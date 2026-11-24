@@ -675,16 +675,18 @@ const ABS_CSS = `
 /* ============================ 고사실 통계 (관리자) ============================
  * 고사실 = 본반(고정반) 교실. 본반 학생 + 다른 학년 이동반 학생이 함께 시험을 본다.
  * 교시마다 그 교실에서 실제 시험을 보는 인원을 세고, 본반·이동반 과목의 통(공통)/선(선택) 조합별
- * 기준 인원 이상이면 색으로 표시한다 (통+통은 1명 배치라 제외). */
+ * 기준 인원 이상이면 색으로 표시한다 (통+통 = 교실의 모든 학생이 공통과목 응시). */
 const GUEST_OF = { 1: 3, 2: 1, 3: 2 }; // 1학년 교실 ← 3학년 이동반, 2학년 ← 1학년, 3학년 ← 2학년
-const DEFAULT_THR = { ts: 22, st: 25, ss: 19 };
+const DEFAULT_THR = { tt: 30, ts: 22, st: 25, ss: 19 };
+const COMBO_KEYS = ['tt', 'ts', 'st', 'ss'];
 const DEFAULT_TIMES = { 1: '09:25 ~ 10:15', 2: '10:35 ~ 11:25', 3: '11:45 ~ 12:35', 4: '' };
 const COMBO = {
-  ts: { label: '본(통)+이(선)', short: '통+선', color: '#A0B4E6', argb: 'FFA0B4E6' },
-  st: { label: '본(선)+이(통)', short: '선+통', color: '#FFCEB0', argb: 'FFFFCEB0' },
-  ss: { label: '본(선)+이(선)', short: '선+선', color: '#9BE5C8', argb: 'FF9BE5C8' },
+  tt: { label: '본(통)+이(통)', short: '통+통', color: '#F4B6D2', argb: 'FFF4B6D2', text: '#be185d', textArgb: 'FFBE185D' },
+  ts: { label: '본(통)+이(선)', short: '통+선', color: '#A0B4E6', argb: 'FFA0B4E6', text: '#1d4ed8', textArgb: 'FF1D4ED8' },
+  st: { label: '본(선)+이(통)', short: '선+통', color: '#FFCEB0', argb: 'FFFFCEB0', text: '#c2410c', textArgb: 'FFC2410C' },
+  ss: { label: '본(선)+이(선)', short: '선+선', color: '#9BE5C8', argb: 'FF9BE5C8', text: '#047857', textArgb: 'FF047857' },
 };
-const comboKey = (bt, gt) => (bt === '통' && gt === '선' ? 'ts' : bt === '선' && gt === '통' ? 'st' : bt === '선' && gt === '선' ? 'ss' : null);
+const comboKey = (bt, gt) => (bt === '통' && gt === '통' ? 'tt' : bt === '통' && gt === '선' ? 'ts' : bt === '선' && gt === '통' ? 'st' : bt === '선' && gt === '선' ? 'ss' : null);
 
 // 기본 고사실 구성: 같은 반 번호의 지정 학년 이동반, 짝이 없는 이동반은 손님 없는 교실로
 function defaultRoomMap(classesByGrade) {
@@ -738,7 +740,7 @@ function statsData(sx) {
   });
   const all = blocks.flatMap(b => b.rooms);
   const totals = { hostN: all.reduce((a, r) => a + r.hostN, 0), guestN: all.reduce((a, r) => a + r.guestN, 0), total: all.reduce((a, r) => a + r.total, 0), cells: slots.map((s, i) => all.reduce((a, r) => a + r.cells[i].n, 0)) };
-  const overs = { ts: 0, st: 0, ss: 0 }; all.forEach(r => r.cells.forEach(x => { if (x.over) overs[x.ck]++; }));
+  const overs = { tt: 0, ts: 0, st: 0, ss: 0 }; all.forEach(r => r.cells.forEach(x => { if (x.over) overs[x.ck]++; }));
   const ttRows = slots.map(s => ({ ...s, date: dayLabel(s.d), time: times[s.p] || '', subs: GRADES.map(g => at(g, s).map(e => e.sub).join('/') || '') }));
   const edRows = slots.map(s => ({ ...s, date: dayLabel(s.d), time: times[s.p] || '', cells: GRADES.map(g => { const l = at(g, s); return { has: l.some(e => !e.self), self: l.length > 0 && l.every(e => e.self), name: editors[`${g}-${s.d}-${s.p}`] || '' }; }) }));
   const dupGuests = Object.keys(guestUse).filter(k => guestUse[k] > 1);
@@ -753,7 +755,7 @@ function statsHTML(D) {
   const th2 = D.slots.map((s, i) => `<th class="ph${i > 0 && D.slots[i - 1].d !== s.d ? ' dl' : ''}">${s.p}교시</th>`).join('');
   const dl = i => (i > 0 && D.slots[i - 1].d !== D.slots[i].d ? ' dl' : '');
   const body = D.blocks.map(b => {
-    const typeRow = `<tr class="ty"><td colspan="5" class="tyl">교시별 과목 유형 (본 ${b.g}학년 + 이 ${b.guestGrade}학년)</td>${b.types.map((t, i) => `<td class="${dl(i)}"${t.ck ? ` style="color:${t.ck === 'ts' ? '#1d4ed8' : t.ck === 'st' ? '#c2410c' : '#047857'};font-weight:700"` : ''}>${esc(t.label)}</td>`).join('')}</tr>`;
+    const typeRow = `<tr class="ty"><td colspan="5" class="tyl">교시별 과목 유형 (본 ${b.g}학년 + 이 ${b.guestGrade}학년)</td>${b.types.map((t, i) => `<td class="${dl(i)}"${t.ck ? ` style="color:${COMBO[t.ck].text};font-weight:700"` : ''}>${esc(t.label)}</td>`).join('')}</tr>`;
     const rows = b.rooms.map((r, ri) => `<tr>${ri === 0 ? `<td rowspan="${b.rooms.length + 1}" class="gl">${b.g}학년</td>` : ''}`
       + `<td class="num">${r.total}</td><td>${r.host}</td><td class="num">${r.hostN}</td><td>${r.guest || '-'}</td><td class="num">${r.guest ? r.guestN : ''}</td>`
       + r.cells.map((x, i) => `<td class="num${dl(i)}"${x.over ? ` style="background:${COMBO[x.ck].color};font-weight:800"` : ''}>${x.n || (x.n === 0 ? '<span class="z">0</span>' : '')}</td>`).join('') + '</tr>').join('');
@@ -762,10 +764,11 @@ function statsHTML(D) {
   const tot = `<tr class="tot"><td>총계</td><td class="num">${D.totals.total}</td><td></td><td class="num">${D.totals.hostN}</td><td></td><td class="num">${D.totals.guestN}</td>${D.totals.cells.map((n, i) => `<td class="num${dl(i)}">${n}</td>`).join('')}</tr>`;
   const ttb = D.ttRows.map((r, i) => `<tr>${i === 0 || D.ttRows[i - 1].d !== r.d ? `<td rowspan="${D.ttRows.filter(x => x.d === r.d).length}" class="b">${esc(r.date)}</td>` : ''}<td>${r.p}교시</td><td class="tm">${esc(r.time)}</td>${r.subs.map(x => `<td class="${x === SELF ? 'self' : ''}">${esc(x || '-')}</td>`).join('')}</tr>`).join('');
   const edb = D.edRows.map((r, i) => `<tr>${i === 0 || D.edRows[i - 1].d !== r.d ? `<td rowspan="${D.edRows.filter(x => x.d === r.d).length}" class="b">${esc(r.date)}</td>` : ''}<td>${r.p}교시</td>${r.cells.map(x => `<td class="${x.has ? '' : 'self'}">${x.has ? esc(x.name) : x.self ? '자습' : '-'}</td>`).join('')}</tr>`).join('');
-  const thr = ['ts', 'st', 'ss'].map(k => `<td style="background:${COMBO[k].color}"><div class="cl">${COMBO[k].label}</div><div class="cv">${D.thr[k]}명 이상</div><div class="cc">${D.overs[k]}칸</div></td>`).join('');
+  const thrTd = k => `<td style="background:${COMBO[k].color};width:50%"><div class="cl">${COMBO[k].label}</div><div class="cv">${D.thr[k]}명 이상</div><div class="cc">${D.overs[k]}칸</div></td>`;
+  const thr = `${thrTd('tt')}${thrTd('ts')}</tr><tr>${thrTd('st')}${thrTd('ss')}`; // 2×2
   return `<div class="stw"><div class="sttitle">${esc(D.examTitle)} 고사실별 응시 인원 통계</div>`
     + `<div class="stgrid"><div class="stleft"><table class="stt"><thead><tr><th rowspan="2">학년</th><th rowspan="2">평가<br>재적</th><th rowspan="2">고정반<br>(본반)</th><th rowspan="2">재적</th><th rowspan="2">이동반</th><th rowspan="2">재적</th>${th1}</tr><tr>${th2}</tr></thead><tbody>${body}${tot}</tbody></table>`
-    + `<div class="stnote">· 숫자 = 해당 교시에 그 고사실에서 시험을 보는 인원(본반 응시자 + 이동반 응시자) · 색칠 = 감독 배치 기준 이상 · 통+통은 1명 배치로 기준 제외</div></div>`
+    + `<div class="stnote">· 숫자 = 해당 교시에 그 고사실에서 시험을 보는 인원(본반 응시자 + 이동반 응시자) · 색칠 = 감독 배치 기준 이상(정+부 2명 배치)</div></div>`
     + `<div class="stright"><div class="stbox"><div class="stbh">시험 시간표</div><table class="sts"><thead><tr><th>일차</th><th>교시</th><th>시간</th><th>1학년</th><th>2학년</th><th>3학년</th></tr></thead><tbody>${ttb}</tbody></table></div>`
     + `<div class="stbox"><div class="stbh">감독 배치 기준 (본반+이동반 과목 유형)</div><table class="sts thr"><tr>${thr}</tr></table></div>`
     + `<div class="stbox"><div class="stbh">출제(편집)자</div><table class="sts"><thead><tr><th>일차</th><th>교시</th><th>1학년</th><th>2학년</th><th>3학년</th></tr></thead><tbody>${edb}</tbody></table></div>`
@@ -823,7 +826,7 @@ function buildStatsWorkbook(D) {
       ws.getRow(r).height = 17; r++;
     });
     ws.mergeCells(r, 2, r, 6); cell(r, 2, `과목 유형 (본 ${b.g}학년 + 이 ${b.guestGrade}학년)`, { size: 8, color: 'FF475569', fill: 'FFF8FAFC', align: { vertical: 'middle', horizontal: 'right' } });
-    b.types.forEach((t, i) => cell(r, 7 + i, t.label, { size: 8, bold: !!t.ck, color: t.ck === 'ts' ? 'FF1D4ED8' : t.ck === 'st' ? 'FFC2410C' : t.ck === 'ss' ? 'FF047857' : 'FF64748B', fill: 'FFF8FAFC' }));
+    b.types.forEach((t, i) => cell(r, 7 + i, t.label, { size: 8, bold: !!t.ck, color: t.ck ? COMBO[t.ck].textArgb : 'FF64748B', fill: 'FFF8FAFC' }));
     ws.getRow(r).height = 15; r++;
     ws.mergeCells(start, 1, r - 1, 1); cell(start, 1, `${b.g}학년`, { bold: true, size: 12, fill: 'FFF8FAFC' });
   });
@@ -831,7 +834,7 @@ function buildStatsWorkbook(D) {
   cell(r, 1, '총계', { bold: true, fill: tf }); cell(r, 2, D.totals.total, { bold: true, fill: tf }); cell(r, 3, '', { fill: tf }); cell(r, 4, D.totals.hostN, { bold: true, fill: tf }); cell(r, 5, '', { fill: tf }); cell(r, 6, D.totals.guestN, { bold: true, fill: tf });
   D.totals.cells.forEach((v, i) => cell(r, 7 + i, v, { bold: true, fill: tf })); ws.getRow(r).height = 19;
   ws.mergeCells(r + 1, 1, r + 1, 6 + n);
-  cell(r + 1, 1, '· 숫자 = 해당 교시에 그 고사실에서 시험을 보는 인원(본반 응시자 + 이동반 응시자)   · 색칠 = 감독 배치 기준 이상   · 통+통은 1명 배치로 기준 제외', { size: 8, color: 'FF475569', border: false, align: { horizontal: 'left', vertical: 'middle' } });
+  cell(r + 1, 1, '· 숫자 = 해당 교시에 그 고사실에서 시험을 보는 인원(본반 응시자 + 이동반 응시자)   · 색칠 = 감독 배치 기준 이상(정+부 2명 배치)', { size: 8, color: 'FF475569', border: false, align: { horizontal: 'left', vertical: 'middle' } });
   // 오른쪽 ① 시험 시간표
   let q = 3;
   const head = (t, w) => { ws.mergeCells(q, R0, q, R0 + w - 1); cell(q, R0, t, { bold: true, color: 'FFFFFFFF', fill: 'FF334155' }); for (let k = 1; k < w; k++) cell(q, R0 + k, null, { fill: 'FF334155' }); ws.getRow(q).height = Math.max(ws.getRow(q).height || 0, 18); q++; };
@@ -846,12 +849,13 @@ function buildStatsWorkbook(D) {
   q++;
   // ② 감독 배치 기준
   head('감독 배치 기준 (본반+이동반 과목 유형) — 기준 이상이면 색 표시', 6);
-  ['ts', 'st', 'ss'].forEach((k, i) => {
-    const c0 = R0 + i * 2; ws.mergeCells(q, c0, q, c0 + 1); ws.mergeCells(q + 1, c0, q + 1, c0 + 1);
-    cell(q, c0, `${COMBO[k].label} · ${D.overs[k]}칸`, { bold: true, size: 9, fill: COMBO[k].argb }); cell(q, c0 + 1, null, { fill: COMBO[k].argb });
-    cell(q + 1, c0, `${D.thr[k]}명 이상`, { bold: true, size: 12, fill: COMBO[k].argb }); cell(q + 1, c0 + 1, null, { fill: COMBO[k].argb });
+  COMBO_KEYS.forEach((k, i) => { // 2×2 배치 (한 칸 = 3열)
+    const qq = q + (i >= 2 ? 2 : 0), c0 = R0 + (i % 2) * 3;
+    ws.mergeCells(qq, c0, qq, c0 + 2); ws.mergeCells(qq + 1, c0, qq + 1, c0 + 2);
+    cell(qq, c0, `${COMBO[k].label} · ${D.overs[k]}칸`, { bold: true, size: 9, fill: COMBO[k].argb }); cell(qq, c0 + 1, null, { fill: COMBO[k].argb }); cell(qq, c0 + 2, null, { fill: COMBO[k].argb });
+    cell(qq + 1, c0, `${D.thr[k]}명 이상`, { bold: true, size: 12, fill: COMBO[k].argb }); cell(qq + 1, c0 + 1, null, { fill: COMBO[k].argb }); cell(qq + 1, c0 + 2, null, { fill: COMBO[k].argb });
   });
-  ws.getRow(q + 1).height = 22; q += 3;
+  ws.getRow(q + 1).height = 22; ws.getRow(q + 3).height = 22; q += 5;
   // ③ 출제(편집)자
   head('출제(편집)자', 6);
   ['일차', '교시', '시간', '1학년', '2학년', '3학년'].forEach((t, i) => cell(q, R0 + i, t, { bold: true, size: 9, fill: 'FFF2F2F2' })); q++;
@@ -2571,7 +2575,7 @@ function StatsTab({ sx, D, setThr, setTimes, setEditor, setRoom, resetRooms, cla
     <div className="flex flex-wrap items-center gap-2" id="statsSummary">
       <span className="text-xs px-3 py-1.5 rounded-full bg-slate-100 text-slate-700 font-semibold">고사실 ${D.blocks.reduce((a, b) => a + b.rooms.length, 0)}곳 · 시험 교시 ${D.slots.length}개</span>
       <span className=${`text-xs px-3 py-1.5 rounded-full font-semibold ${totalOver ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>기준 이상 ${totalOver}칸</span>
-      ${['ts', 'st', 'ss'].map(k => html`<span key=${k} className="text-xs px-2.5 py-1.5 rounded-full font-semibold" style=${{ background: COMBO[k].color }}>${COMBO[k].label} ${D.overs[k]}</span>`)}
+      ${COMBO_KEYS.map(k => html`<span key=${k} className="text-xs px-2.5 py-1.5 rounded-full font-semibold" style=${{ background: COMBO[k].color }}>${COMBO[k].label} ${D.overs[k]}</span>`)}
       ${D.dupGuests.length > 0 && html`<span className="text-xs text-rose-600 font-semibold">⚠ 두 교실에 배치된 이동반: ${D.dupGuests.join(', ')}</span>`}
       ${D.unplaced.length > 0 && html`<span className="text-xs text-amber-700 font-semibold">⚠ 교실이 없는 이동반: ${D.unplaced.join(', ')}</span>`}
     </div>
@@ -2579,9 +2583,9 @@ function StatsTab({ sx, D, setThr, setTimes, setEditor, setRoom, resetRooms, cla
     <div className="grid md:grid-cols-2 gap-3">
       <div className="border border-slate-200 rounded-xl p-4">
         <div className="text-sm font-bold text-slate-800 mb-1">감독 배치 기준 인원</div>
-        <p className="text-[11px] text-slate-500 mb-3">본반(고정반)과 이동반 과목의 통·선 조합별로, 고사실 응시 인원이 이 수 <b>이상</b>이면 표에 색으로 표시합니다. 통+통은 1명 배치라 제외합니다.</p>
-        <div className="grid grid-cols-3 gap-2">
-          ${['ts', 'st', 'ss'].map(k => html`<label key=${k} className="rounded-lg p-2.5 text-center" style=${{ background: COMBO[k].color }}>
+        <p className="text-[11px] text-slate-500 mb-3">본반(고정반)과 이동반 과목의 통·선 조합별로, 고사실 응시 인원이 이 수 <b>이상</b>이면 표에 색으로 표시하고 감독 시간표에서 <b>정+부 2명</b>을 배치합니다. 통+통은 그 교실의 학생이 모두 공통과목을 보는 경우입니다. (0 = 기준 사용 안 함)</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          ${COMBO_KEYS.map(k => html`<label key=${k} className="rounded-lg p-2.5 text-center" style=${{ background: COMBO[k].color }}>
             <div className="text-[11px] font-bold text-slate-800">${COMBO[k].label}</div>
             <div className="flex items-center justify-center gap-1 mt-1.5"><input type="number" min="0" max="99" data-thr=${k} value=${sx.thr[k]} onInput=${e => setThr(k, Math.max(0, parseInt(e.target.value) || 0))} className="w-16 text-center text-lg font-black rounded-md border border-white/70 bg-white/80 py-0.5" /><span className="text-xs font-semibold">명↑</span></div>
           </label>`)}
