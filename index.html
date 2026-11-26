@@ -1260,6 +1260,31 @@ function supGenerate(m) {
   return out;
 }
 // 이전 감독표(이 프로그램의 '교사(전체)' 시트 등)에서 교사별 '총계' 읽기
+// 이전 감독 횟수 입력 양식 (현재 교사 명단과 입력값을 미리 채움) — [지난 감독표에서 횟수 불러오기]로 다시 올림
+function buildPrevTemplate(teachers, examTitle) {
+  const wb = new ExcelJS.Workbook(); wb.creator = '정기고사 부착물 시스템';
+  const ws = wb.addWorksheet('이전 감독 입력', { pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
+  const B = XL.border, C = { vertical: 'middle', horizontal: 'center' };
+  ws.mergeCells('A1:F1');
+  const t = ws.getCell('A1'); t.value = `${examTitle} 감독 편성 — 이전 감독 횟수 입력 양식`; t.font = XL.font(14, true); t.alignment = C; ws.getRow(1).height = 28;
+  ws.mergeCells('A2:F2');
+  const n = ws.getCell('A2'); n.value = "· '이전 감독'(이번 시험 전까지의 감독 누계)과 '모고 지원'(모의고사 감독 지원 횟수)만 입력하세요. 총계는 자동 계산됩니다.  · 교사 이름은 바꾸지 마세요. 새 교사는 아래에 이름을 추가하면 됩니다.  · 입력 후 [지난 감독표에서 횟수 불러오기]로 올리세요.";
+  n.font = XL.font(9, false, 'FF475569'); n.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true }; ws.getRow(2).height = 42;
+  const head = ['번호', '교사', '이전 감독', '모고 지원', '총계(자동)', '비고'];
+  head.forEach((h, i) => { const c = ws.getCell(3, i + 1); c.value = h; c.font = XL.font(10, true); c.alignment = C; c.border = B; c.fill = XL.fill(i === 2 || i === 3 ? 'FFFFF2CC' : 'FFE7E6E6'); });
+  const list = [...teachers].sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+  const rows = Math.max(list.length + 10, 20);
+  for (let i = 0; i < rows; i++) {
+    const r = 4 + i, tch = list[i];
+    const vals = [i + 1, tch ? tch.name : '', tch ? (+tch.prev || 0) : null, tch ? (+tch.mock || 0) : null, { formula: `IF(B${r}="","",N(C${r})+N(D${r}))` }, ''];
+    vals.forEach((v, k) => { const c = ws.getCell(r, k + 1); if (v !== null) c.value = v; c.font = XL.font(10, k === 1); c.alignment = C; c.border = B; if (k === 2 || k === 3) c.fill = XL.fill('FFFFFBEA'); if (k === 4) c.fill = XL.fill('FFF1F5F9'); });
+    ws.getRow(r).height = 18;
+  }
+  [6, 12, 11, 11, 11, 22].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+  ws.views = [{ state: 'frozen', ySplit: 3 }];
+  ws.dataValidations.add(`C4:D${3 + rows}`, { type: 'whole', operator: 'greaterThanOrEqual', formulae: [0], allowBlank: true, showErrorMessage: true, errorTitle: '숫자만', error: '0 이상의 정수를 입력하세요.' });
+  return wb;
+}
 function parsePrevCounts(wb) {
   const found = {};
   wb.SheetNames.forEach(name => {
@@ -1267,15 +1292,19 @@ function parsePrevCounts(wb) {
     for (let r = 0; r < Math.min(rows.length, 8); r++) {
       const row = rows[r].map(v => String(v).replace(/\s+/g, ''));
       let tc = -1; row.forEach((v, c) => { if (/총계$/.test(v)) tc = c; });
-      if (tc < 0) continue;
+      const pc = row.findIndex(v => /^이전감독/.test(v)); // 입력 양식: '이전 감독' 열을 그대로 사용
+      if (tc < 0 && pc < 0) continue;
       let nc = row.findIndex(v => /^(교사|성명|이름|교사명)$/.test(v)); if (nc < 0) nc = 0;
       const mc = row.findIndex(v => /^(모고|모의고사)/.test(v)); // 모의고사 지원 횟수 열
       const num = x => { const v = parseFloat(String(x ?? '').replace(/[^\d.\-]/g, '')); return isNaN(v) ? 0 : v; };
       for (let k = r + 1; k < rows.length; k++) {
         const nm = String(rows[k][nc] ?? '').replace(/\(.*?\)/g, '').replace(/\s+/g, '');
+        if (!/^[가-힣A-Za-z]{2,12}$/.test(nm) || nm in found) continue;
+        const mock = mc >= 0 ? num(rows[k][mc]) : 0;
+        if (pc >= 0) { const prev = num(rows[k][pc]); found[nm] = { total: prev + mock, mock, prev }; continue; }
         const raw = String(rows[k][tc] ?? '').trim();
-        if (!/^[가-힣A-Za-z]{2,12}$/.test(nm) || !/\d/.test(raw) || nm in found) continue;
-        const total = num(raw), mock = mc >= 0 ? num(rows[k][mc]) : 0;
+        if (!/\d/.test(raw)) continue;
+        const total = num(raw);
         found[nm] = { total, mock, prev: Math.max(0, total - mock) };
       }
       break;
@@ -2163,12 +2192,19 @@ function App() {
     try {
       const { wb } = await readFile(file);
       const f = parsePrevCounts(wb), names = Object.keys(f);
-      if (!names.length) { say("지난 감독표에서 '총계' 열을 찾지 못했습니다. 이 프로그램으로 내려받은 감독표 엑셀('교사(전체)' 시트)을 올리세요.", 'error'); return; }
+      if (!names.length) { say("'이전 감독' 또는 '총계' 열을 찾지 못했습니다. [이전 감독 입력 양식]이나 이 프로그램으로 내려받은 감독표 엑셀('교사(전체)' 시트)을 올리세요.", 'error'); return; }
       const hit = sup.teachers.filter(t => t.name in f), miss = sup.teachers.filter(t => !(t.name in f)).map(t => t.name);
-      if (!confirm(`지난 감독표 '${file.name}'에서 ${names.length}명의 총계를 찾았습니다.\n명단과 일치하는 ${hit.length}명에게 '이전 감독' = 총계 − 모의고사, '모고 지원' = 모의고사 횟수로 넣습니다.\n계속할까요?`)) return;
+      const isTpl = wb.SheetNames.some(n => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '' }).slice(0, 8).some(r => r.some(v => /^이전\s*감독/.test(String(v).trim()))));
+      if (!confirm(`'${file.name}'에서 ${names.length}명의 횟수를 찾았습니다.\n명단과 일치하는 ${hit.length}명에게 ${isTpl ? "양식에 적은 '이전 감독'·'모고 지원' 값을 그대로" : "'이전 감독' = 총계 − 모의고사, '모고 지원' = 모의고사 횟수로"} 넣습니다.\n계속할까요?`)) return;
       setSup(x => ({ ...x, teachers: x.teachers.map(t => (t.name in f ? { ...t, prev: f[t.name].prev, mock: f[t.name].mock } : t)) }));
       say(`✓ 이전 감독 횟수 반영: ${hit.length}명${miss.length ? ` · 지난 감독표에 없는 교사 ${miss.length}명(그대로 둠): ${miss.slice(0, 12).join(', ')}${miss.length > 12 ? ' …' : ''}` : ''}`);
     } catch (err) { say(`지난 감독표 읽기 오류: ${err.message}`, 'error'); }
+  };
+  const supPrevTemplate = async () => {
+    try {
+      await downloadWorkbook(buildPrevTemplate(sup.teachers, examTitle), `${examTitle.replace(/\s+/g, '_')}_이전감독_입력양식.xlsx`);
+      say(sup.teachers.length ? `📥 이전 감독 입력 양식 다운로드 — 교사 ${sup.teachers.length}명(가나다순)이 채워져 있습니다. '이전 감독'·'모고 지원'을 입력한 뒤 [지난 감독표에서 횟수 불러오기]로 올리세요.` : "📥 이전 감독 입력 양식 다운로드 — 교사 이름과 횟수를 입력한 뒤 [지난 감독표에서 횟수 불러오기]로 올리세요. (교사 시간표를 먼저 올리면 명단이 채워진 양식을 받을 수 있습니다)");
+    } catch (err) { say(`양식 만들기 오류: ${err.message}`, 'error'); }
   };
   const exportSup = async kind => {
     if (!supM || !supM.slots.length) { say('시험 시간표와 교사 명단을 먼저 입력하세요.', 'error'); return; }
@@ -2371,7 +2407,7 @@ function App() {
               setThr=${(k, v) => setThrState(x => ({ ...x, [k]: v }))} setTimes=${(pp, v) => setTimesState(x => ({ ...x, [pp]: v }))}
               setEditor=${(k, v) => setEditors(x => ({ ...x, [k]: v }))} setRoom=${(hk, v) => setRoomOv(x => ({ ...x, [hk]: v }))} resetRooms=${() => setRoomOv({})} />`}
           ${tab === 'supervise' && !VIEWER && supM && html`<${SuperviseTab} sup=${sup} setSup=${setSup} m=${supM} chk=${supChk} counts=${supCnt} examTitle=${examTitle} classesByGrade=${classesByGrade} say=${say}
-              onUploadTT=${onSupTT} onImportPrev=${onSupPrev} onExport=${exportSup} busy=${busy} />`}
+              onUploadTT=${onSupTT} onImportPrev=${onSupPrev} onPrevTemplate=${supPrevTemplate} onExport=${exportSup} busy=${busy} />`}
           ${tab === 'absence' && !VIEWER && html`<${AbsencePreview} ab=${ab} setAb=${setAb} ctx=${ctx} classesByGrade=${classesByGrade} presentGrades=${presentGrades} roomMap=${roomMap} onExport=${t => exportFile(3, t)} onExportRooms=${pairs => exportFile(5, null, pairs)} busy=${busy} />`}
         </div>
       </div>
@@ -2638,7 +2674,7 @@ const SUP_KIND_CLS = { R: 'bg-white', C: 'bg-emerald-100 text-emerald-900', W: '
 function SupBox({ title, sub, children, id }) {
   return html`<div className="border border-slate-200 rounded-xl p-3.5" id=${id}><div className="text-sm font-bold text-slate-800">${title}</div>${sub && html`<p className="text-[11px] text-slate-500 mt-0.5 mb-2">${sub}</p>`}${children}</div>`;
 }
-function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, say, onUploadTT, onImportPrev, onExport, busy }) {
+function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, say, onUploadTT, onImportPrev, onPrevTemplate, onExport, busy }) {
   const [view, setView] = useState(sup.teachers.length ? 'grid' : 'list');
   const [dayI, setDayI] = useState(0);
   const [pick, setPick] = useState(null);
@@ -2725,7 +2761,8 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   const top = html`<div className="space-y-2">
     <div className="flex flex-wrap items-center gap-1.5">
       <label className=${`${pbtn} bg-emerald-600 text-white cursor-pointer`}>⬆ 교사 주간시간표 올리기<input id="supTTInput" type="file" accept=".xlsx,.xls,.xlsm" onChange=${onUploadTT} className="hidden" /></label>
-      <label className=${`${pbtn} bg-slate-700 text-white cursor-pointer`} title="이 프로그램으로 만든 지난 감독표 엑셀의 '교사(전체)' 시트에서 교사별 총계를 '이전 감독 횟수'로 가져옵니다">⬆ 지난 감독표에서 횟수 불러오기<input id="supPrevInput" type="file" accept=".xlsx,.xls,.xlsm" onChange=${onImportPrev} className="hidden" /></label>
+      <label className=${`${pbtn} bg-slate-700 text-white cursor-pointer`} title="[이전 감독 입력 양식] 또는 이 프로그램으로 만든 지난 감독표 엑셀('교사(전체)' 시트)에서 교사별 이전 감독·모고 지원 횟수를 가져옵니다">⬆ 지난 감독표에서 횟수 불러오기<input id="supPrevInput" type="file" accept=".xlsx,.xls,.xlsm" onChange=${onImportPrev} className="hidden" /></label>
+      <button id="supPrevTpl" onClick=${onPrevTemplate} title="현재 교사 명단이 채워진 엑셀 양식에 이전 감독·모고 지원 횟수를 입력한 뒤 다시 올리세요" className=${`${pbtn} bg-white text-slate-700 border border-slate-300 hover:bg-slate-50`}>⬇ 이전 감독 입력 양식</button>
       <button id="supGen" onClick=${generate} className=${`${pbtn} bg-indigo-600 text-white`}>⚙ 자동 편성</button>
       <span className="ml-auto flex flex-wrap gap-1.5">
         <button id="supXl" disabled=${busy || !m.slots.length} onClick=${() => onExport('xlsx')} className=${`${pbtn} bg-emerald-700 text-white`}>⬇ 엑셀</button>
