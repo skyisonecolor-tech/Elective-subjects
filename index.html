@@ -989,7 +989,7 @@ const defaultSup = () => ({ teachers: [], ttLabel: '', wd: {}, cls: {}, pmap: { 
 const SUP_ONLY = { '': '제한 없음', subcor: '2감독·복도만', sub: '2감독(부)만', cor: '복도만' };
 const newTeacher = (name, hours = 0, tt = {}) => ({ name, hours, tt, home: '', only: '', prev: 0, mock: 0, ex: { mode: '', days: {}, reason: '' }, subAdd: [], subDel: [] });
 const splitNames = s => String(s || '').split(/[\/,·;\s]+/).map(x => x.trim()).filter(Boolean);
-const supText = (code, short) => { const [k, a, b] = String(code).split('|'); return k === 'R' ? `${a}(${b})` : k === 'C' ? a : k === 'W' ? `대기${a}` : code; };
+const supText = (code, short) => { const [k, a, b] = String(code).split('|'); return k === 'R' ? `${a}(${b})` : k === 'C' ? a : k === 'W' ? `대기${a}` : k === 'S' ? `지원 ${a}` : code; };
 
 // 교사 주간시간표: 위쪽에 요일(월~금) 행, 그 아래 교시 번호 행, 첫 열 '이름(시수)', 칸은 '302\nB_언매'(학년·반 + 블록_과목 약칭)
 function parseTTCell(v) {
@@ -1099,6 +1099,13 @@ function supModel(sup, D, sx) {
     rooms.forEach(r => { pos.push(`R|${r.room}|정`); if (r.need > 1) pos.push(`R|${r.room}|부`); });
     (sup.posts || []).forEach(p => { if (p.name) pos.push(`C|${p.name}`); });
     for (let k = 1; k <= (+sup.standby || 0); k++) pos.push(`W|${k}`);
+    // 지원 감독 자리: 설정한 (일차·교시·학년)의 모든 교실 (응시 인원 0명 교실 포함, 수업하는 학년 제외)
+    const spos = [];
+    GRADES.forEach(g => { if (sup.support && sup.support[`${s.d}-${s.p}-${g}`] && !classG.includes(g)) classesByGrade[g].forEach(c => spos.push(`S|${clsKey(g, c)}`)); });
+    // 관리자가 강제로 더하거나 없앤 자리 (부감독·대기·지원)
+    const addF = ((sup.posAdd || {})[key] || []), offF = new Set((sup.posOff || {})[key] || []);
+    addF.forEach(c => { const l = c[0] === 'S' ? spos : pos; if (!l.includes(c)) l.push(c); });
+    const pos2 = pos.filter(c => !offF.has(c)), spos2 = spos.filter(c => !offF.has(c));
     const cps = (sup.pmap && sup.pmap[s.p] && sup.pmap[s.p].length) ? sup.pmap[s.p] : [s.p];
     const info = {};
     sup.teachers.forEach(t => {
@@ -1113,11 +1120,30 @@ function supModel(sup, D, sx) {
       if (same.length) o.same = same;
       info[t.name] = o;
     });
-    return { key, i, d: s.d, p: s.p, wd, ...dt, time: times[s.p] || '', subs, classG, rooms, pos, info };
+    return { key, i, d: s.d, p: s.p, wd, ...dt, time: times[s.p] || '', subs, classG, rooms, pos: pos2, spos: spos2, nAdd: addF.length, nOff: offF.size, info };
   });
   const days = []; slots.forEach(s => { const l = days[days.length - 1]; if (l && l.d === s.d) l.slots.push(s); else days.push({ d: s.d, md: s.md, dot: s.dot, sh: s.sh, wd: s.wd, awd: supWdOf({ wd: {} }, tt, s.d), slots: [s] }); });
   const sorted = [...sup.teachers].sort((a, b) => a.name.localeCompare(b.name, 'ko')); // 감독표는 교사명 가나다순
-  return { slots, days, teachers: sorted, autoSubs, subsOf, teachSum, forbid, moveRoomOf, issues, examSubs, sup, present, classes: classesByGrade, tmap: Object.fromEntries(sorted.map(t => [t.name, t])) };
+  // 복도 위치 설명('1학년 10,11반')에서 담당 학년·반을 읽어 지원 감독이 모자랄 때 가까운 복도 감독을 고른다
+  const postArea = {};
+  (sup.posts || []).forEach(p => {
+    const a = []; const re = /([1-3])\s*학년\s*([\d\s,·~\-]*)/g; let mm;
+    while ((mm = re.exec(String(p.desc || '')))) {
+      const cs = []; String(mm[2] || '').split(/[,·\s]+/).filter(Boolean).forEach(x => { const r = x.split(/[~\-]/).map(Number); if (r.length === 2 && r[0] && r[1]) { for (let c = r[0]; c <= r[1]; c++) cs.push(c); } else if (+x) cs.push(+x); });
+      a.push({ g: +mm[1], cs });
+    }
+    postArea[p.name] = a;
+  });
+  // 배치도가 있으면 복도 위치의 층(이름의 'N층')과 담당 교실(설명)로 복도 감독 자리를 정한다
+  const postLoc = {}, LY = sup.layout && sup.layout.rooms ? sup.layout.rooms : {};
+  (sup.posts || []).forEach(p => {
+    const fm = String(p.name).match(/([1-9])\s*층/), area = (postArea[p.name] || []).flatMap(a => a.cs.length ? a.cs.map(c => `${a.g}-${c}`) : Object.keys(LY).filter(k => +k.split('-')[0] === a.g)).filter(k => LY[k]);
+    const f = fm ? +fm[1] : area.length ? LY[area[0]].f : null; if (f == null) return;
+    const same = area.filter(k => LY[k].f === f), onF = Object.values(LY).filter(r => r.f === f);
+    const pts = same.length ? same.map(k => LY[k]) : onF;
+    postLoc[p.name] = { f, x: pts.length ? pts.reduce((a, r) => a + r.x, 0) / pts.length : 0, row: same.length ? LY[same[0]].row : null };
+  });
+  return { postArea, postLoc, slots, days, teachers: sorted, autoSubs, subsOf, teachSum, forbid, moveRoomOf, issues, examSubs, sup, present, classes: classesByGrade, tmap: Object.fromEntries(sorted.map(t => [t.name, t])) };
 }
 // 칸 하나에 이 교사가 이 자리를 맡을 수 있는지 (안 되면 이유)
 function supCan(m, s, name, code) {
@@ -1138,14 +1164,29 @@ function supCan(m, s, name, code) {
   if (k === 'W' && o.same) return `${name} 선생님은 같은 과목 시험 시간이라 대기 감독(교실 투입 가능)을 맡지 않습니다.`;
   return null;
 }
+// 지원 감독: 교실 감독(정·부)과 겸할 수 없고, 복도·대기 감독은 겸할 수 있다 (감독 횟수에는 넣지 않음)
+const supSA = (m, s) => ((m.sup.sassign || {})[s.key] || {});
+const supRoomsOf = (m, s, name) => Object.keys(supSA(m, s)).filter(r => supSA(m, s)[r] === name);
+function supCanS(m, s, name, room, code) {
+  const o = s.info[name]; if (!o) return `${name} 선생님은 교사 명단에 없습니다.`;
+  if (o.ex) return `${name} 선생님은 ${s.md} '${o.ex}'(으)로 감독에서 빠집니다.`;
+  if (o.busy) return `${name} 선생님은 ${s.md} ${s.p}교시에 ${o.busy}이 있습니다.`;
+  if (o.hq) return `${name} 선생님은 ${o.hq} 출제자라 고사본부(♣)에서 대기합니다.`;
+  if (code && code[0] === 'R') return `${name} 선생님은 이 교시에 교실 감독(${supText(code)})이라 지원 감독을 겸할 수 없습니다.`;
+  if (o.same) return `${name} 선생님은 같은 과목(${o.same.join(', ')}) 시험 시간이라 교실 지원 감독을 맡을 수 없습니다.`;
+  if (m.forbid[name] && m.forbid[name].has(room)) return `${name} 선생님은 담임 학급과 관련된 ${room} 교실을 지원 감독할 수 없습니다.`;
+  if ((((m.tmap || {})[name] || {}).only || '') === 'cor') return `${name} 선생님은 '복도만' 가능(특이사항)이라 지원 감독을 맡을 수 없습니다.`;
+  return null;
+}
 // 화면·출력용 칸 상태
 function supCell(m, s, name) {
   const o = s.info[name] || {}, code = ((m.sup.assign || {})[s.key] || {})[name] || '';
-  if (o.ex) return { kind: 'X', text: o.ex, fixed: true, code };
-  if (o.busy) return { kind: 'L', text: '수업', title: o.busy, fixed: true, code };
-  if (o.hq) return { kind: 'H', text: `♣ ${o.hq}`, short: '♣', fixed: true, code };
-  if (!code) return { kind: '', text: '', code, same: o.same };
-  return { kind: code[0], text: supText(code), code, same: o.same };
+  const sr = supRoomsOf(m, s, name), st = sr.map(r => `지원${r}`).join(',');
+  if (o.ex) return { kind: 'X', text: o.ex, fixed: true, code, sr };
+  if (o.busy) return { kind: 'L', text: '수업', title: o.busy, fixed: true, code, sr };
+  if (o.hq) return { kind: 'H', text: `♣ ${o.hq}`, short: '♣', fixed: true, code, sr };
+  if (!code) return sr.length ? { kind: 'S', text: `지원 ${sr.join(',')}`, code, sr, same: o.same } : { kind: '', text: '', code, sr, same: o.same };
+  return { kind: code[0], text: sr.length ? `${supText(code)}+${st}` : supText(code), code, sr, same: o.same };
 }
 // 편성표 점검: 규칙 위반 칸, 빈 자리
 function supCheck(m) {
@@ -1160,6 +1201,14 @@ function supCheck(m) {
     });
     const taken = new Set(Object.values(A));
     const miss = s.pos.filter(c => !taken.has(c));
+    const SA = supSA(m, s), sUsed = {};
+    Object.entries(SA).forEach(([room, t]) => {
+      if (!t) return;
+      const err = !s.spos.includes(`S|${room}`) ? `이 교시에는 '${room}' 지원 감독 자리가 없습니다.` : sUsed[t] ? `${t} 선생님이 지원 감독을 두 곳(${sUsed[t]}, ${room}) 맡았습니다.` : supCanS(m, s, t, room, A[t] || '');
+      sUsed[t] = sUsed[t] || room;
+      if (err) { (cellErr[s.key] = cellErr[s.key] || {})[t] = err; list.push(`${s.md} ${s.p}교시 — ${err}`); }
+    });
+    s.spos.forEach(c => { if (!SA[c.split('|')[1]]) miss.push(c); });
     if (miss.length) unfilled[s.key] = miss;
   });
   // 3교시 연속(감독·복도·수업) — 금지는 아니지만 표시
@@ -1177,7 +1226,7 @@ function supCheck(m) {
 // 교사별 횟수 (교실·복도는 감독 횟수, 대기는 따로)
 function supCounts(m) {
   const C = {};
-  m.teachers.forEach(t => { C[t.name] = { room: 0, cor: 0, stb: 0, hq: 0, cls: 0, day: {}, mock: +t.mock || 0, prev: +t.prev || 0 }; });
+  m.teachers.forEach(t => { C[t.name] = { room: 0, cor: 0, stb: 0, sup: 0, hq: 0, cls: 0, day: {}, mock: +t.mock || 0, prev: +t.prev || 0 }; });
   m.slots.forEach(s => {
     m.teachers.forEach(t => { const o = s.info[t.name]; if (!o || o.ex) return; if (o.busy) C[t.name].cls++; else if (o.hq) C[t.name].hq++; });
     Object.entries((m.sup.assign || {})[s.key] || {}).forEach(([n, code]) => {
@@ -1185,6 +1234,7 @@ function supCounts(m) {
       if (code[0] === 'R') c.room++; else if (code[0] === 'C') c.cor++; else if (code[0] === 'W') c.stb++;
       if (code[0] === 'R' || code[0] === 'C') c.day[s.d] = (c.day[s.d] || 0) + 1;
     });
+    Object.values(supSA(m, s)).forEach(n => { if (C[n]) C[n].sup++; }); // 지원 감독: 횟수에는 넣지 않고 따로 셈
   });
   Object.values(C).forEach(c => { c.now = c.room + c.cor; c.load = c.now + c.cls; c.sum = c.room + c.cor + c.cls + c.stb; c.total = c.sum + c.mock + c.prev; }); // 합계 = 이번 시험(교실+복도+수업+대기), 총계 = 합계+모고+이전
   return C;
@@ -1259,6 +1309,50 @@ function supGenerate(m) {
   }
   return out;
 }
+// 지원 감독 자동 배정 (1·2감독·복도·대기 편성은 그대로 둠)
+//  ① 그 교시에 아무 자리도 없는 교사 중 지원을 적게 맡은 교사 → ② 모자라면 그 교실과 가까운 복도 감독 → ③ 대기 감독
+function supGenSupport(m, assign) {
+  const T = m.teachers.map(t => t.name), cnt = {}; T.forEach(n => { cnt[n] = 0; });
+  const load = {}; T.forEach(n => { load[n] = 0; });
+  m.slots.forEach(s => Object.entries(assign[s.key] || {}).forEach(([n, c]) => { if (c && (c[0] === 'R' || c[0] === 'C') && n in load) load[n]++; }));
+  const L = m.sup.layout && m.sup.layout.rooms && Object.keys(m.sup.layout.rooms).length ? m.sup.layout : null;
+  const near = (code, room) => {
+    if (L && L.rooms[room]) {
+      const rl = L.rooms[room];
+      if (code[0] === 'W') return L.office ? layDist(L.office, rl) + 150 : 5000;
+      const pl = (m.postLoc || {})[code.split('|')[1]];
+      return pl ? layDist(pl, rl) : 4000;
+    }
+    if (code[0] === 'W') return 30;
+    const [g, c] = room.split('-').map(Number), a = (m.postArea || {})[code.split('|')[1]] || [];
+    if (a.some(x => x.g === g && x.cs.includes(c))) return 0;
+    if (a.some(x => x.g === g && !x.cs.length)) return 5;
+    if (a.some(x => x.g === g)) return 10 + Math.min(...a.filter(x => x.g === g).flatMap(x => x.cs.map(k => Math.abs(k - c))).concat([9]));
+    return 25;
+  };
+  const out = {};
+  m.slots.forEach(s => {
+    const A = assign[s.key] || {}, SA = out[s.key] = {}, used = new Set();
+    const rooms = s.spos.map(c => c.split('|')[1]);
+    const ok = (x, room) => !used.has(x) && !supCanS(m, s, x, room, A[x] || '');
+    const freeT = T.filter(x => !A[x] && rooms.some(r => ok(x, r)));
+    // 남는 교사로 다 못 채우면, 복도·대기 감독과 가장 가까운 교실끼리 먼저 짝지어 겸하게 한다
+    let need = rooms.length - freeT.length;
+    if (need > 0) {
+      const pairs = [];
+      rooms.forEach(r => T.forEach(x => { if (A[x] && (A[x][0] === 'C' || A[x][0] === 'W') && ok(x, r)) pairs.push([near(A[x], r), r, x]); }));
+      pairs.sort((a, b) => a[0] - b[0] || cnt[a[2]] - cnt[b[2]]);
+      for (const [, r, x] of pairs) { if (need <= 0) break; if (SA[r] || used.has(x)) continue; SA[r] = x; used.add(x); cnt[x]++; need--; }
+    }
+    rooms.forEach(room => {
+      if (SA[room]) return;
+      const n = T.filter(x => !A[x] && ok(x, room)).sort((a, b) => cnt[a] - cnt[b] || load[a] - load[b] || a.localeCompare(b, 'ko'))[0]
+        || T.filter(x => A[x] && (A[x][0] === 'C' || A[x][0] === 'W') && ok(x, room)).sort((a, b) => near(A[a], room) - near(A[b], room) || cnt[a] - cnt[b])[0];
+      if (n) { SA[room] = n; used.add(n); cnt[n]++; }
+    });
+  });
+  return out;
+}
 // 이전 감독표(이 프로그램의 '교사(전체)' 시트 등)에서 교사별 '총계' 읽기
 // 이전 감독 횟수 입력 양식 (현재 교사 명단과 입력값을 미리 채움) — [지난 감독표에서 횟수 불러오기]로 다시 올림
 function buildPrevTemplate(teachers, examTitle) {
@@ -1323,7 +1417,7 @@ const SUP_CSS = `
 .sup thead th{background:#E7E6E6;font-weight:700}
 .sup th.ph{background:#C49DD6}.sup th.mvh{background:#BBE76C}.sup td.mv{background:#F1FBE6}
 .sup td.nm{font-weight:700}.sup td.lb{font-weight:700;background:#F8FAFC}
-.sup td.cC{background:#CDF2E4}.sup td.cH{background:#42C7F1;font-weight:700}.sup td.cX{background:#FFE7D8}.sup td.cW{color:#E00000;font-weight:800}.sup td.cL{color:#94a3b8;background:#F1F5F9}
+.sup td.cS,.sup th.cS{background:#D5F5F0}.sup td.cC{background:#CDF2E4}.sup td.cH{background:#42C7F1;font-weight:700}.sup td.cX{background:#FFE7D8}.sup td.cW{color:#E00000;font-weight:800}.sup td.cL{color:#94a3b8;background:#F1F5F9}
 .sup td.err{outline:2px solid #e11d48;outline-offset:-2px}
 .sup .right{flex:1 1 auto;display:flex;flex-direction:column;gap:2mm;min-width:0}
 .sup .box{border:1px solid #444}.sup .bh{background:#334155;color:#fff;font-weight:700;padding:1.5pt 4pt}
@@ -1353,29 +1447,33 @@ function supDayHTML(m, day, examTitle, chk) {
   const posts = (m.sup.posts || []).filter(p => p.name);
   const corb = posts.length ? `<div class="box"><div class="bh">복도 감독</div><table><thead><tr><th>위치</th>${S.map(s => `<th>${s.p}교시</th>`).join('')}</tr></thead><tbody>${posts.map(p => `<tr><td class="lb">${esc(p.name)}${p.desc ? `<div class="sub">${esc(p.desc)}</div>` : ''}</td>${S.map(s => `<td>${esc(who(s, c => c.code === `C|${p.name}`).join(', '))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '';
   const nW = +m.sup.standby || 0;
-  const stbb = nW ? `<div class="box"><div class="bh">대기 감독 (교무실)</div><table><tbody>${S.map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(Array.from({ length: nW }, (_, k) => { const n = who(s, c => c.code === `W|${k + 1}`)[0]; return n ? `${k + 1}. ${n}` : ''; }).filter(Boolean).join('  ') || '-')}</td></tr>`).join('')}</tbody></table></div>` : '';
-  const note = `<div class="box note">${esc(m.sup.note || '')}\n\n<b>&lt;기호 표시&gt;</b> ♣ 출제 교과 시험(고사본부 대기) · <span style="background:#CDF2E4">복도</span> · <span style="color:#E00000;font-weight:800">대기</span> · <span style="background:#FFE7D8">관리·제외</span> · (정) 정감독 (부) 부감독</div>`;
-  return `<div class="sup fit" style="${supA4Fit(m.teachers.length + 2)}"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 감독표</div><div class="wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table><div class="right">${ttb}${hqb}${corb}${stbb}${note}</div></div></div>`;
+  const stbb = S.some(s => s.pos.some(c => c[0] === 'W')) ? `<div class="box"><div class="bh">대기 감독 (교무실)</div><table><tbody>${S.map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(s.pos.filter(c => c[0] === 'W').map(c => { const n = who(s, x => x.code === c)[0]; return n ? `${c.split('|')[1]}. ${n}` : ''; }).filter(Boolean).join('  ') || '-')}</td></tr>`).join('')}</tbody></table></div>` : '';
+  const supb = S.some(s => s.spos.length) ? `<div class="box"><div class="bh">지원 감독</div><table><tbody>${S.filter(s => s.spos.length).map(s => `<tr><td style="width:13mm">${s.p}교시</td><td style="text-align:left">${esc(s.spos.map(c => { const r = c.split('|')[1], n = supSA(m, s)[r]; return `${r} ${n || '(미배정)'}`; }).join('  '))}</td></tr>`).join('')}</tbody></table></div>` : '';
+  const note = `<div class="box note">${esc(m.sup.note || '')}\n\n<b>&lt;기호 표시&gt;</b> ♣ 출제 교과 시험(고사본부 대기) · <span style="background:#CDF2E4">복도</span> · <span style="color:#E00000;font-weight:800">대기</span> · <span style="background:#FFE7D8">관리·제외</span> · <span style="background:#D5F5F0">지원</span> · (정) 정감독 (부) 부감독</div>`;
+  return `<div class="sup fit" style="${supA4Fit(m.teachers.length + 2)}"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 감독표</div><div class="wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table><div class="right">${ttb}${hqb}${corb}${stbb}${supb}${note}</div></div></div>`;
 }
 function supClassHTML(m, day, examTitle) {
   const S = day.slots;
   const nameOf = (s, code) => m.teachers.filter(t => ((m.sup.assign || {})[s.key] || {})[t.name] === code).map(t => t.name).join(', ');
-  const head = `<tr><th rowspan="2" style="width:9mm">학년</th><th rowspan="2">반</th>${S.map(s => `<th colspan="2" class="ph">${s.p}교시 <span style="font-weight:400;font-size:6.5pt">${esc(s.time)}</span></th>`).join('')}</tr><tr>${S.map(() => '<th>제1감독(정)</th><th>제2감독(부)</th>').join('')}</tr>`;
+  const hasS = S.some(s => s.spos.length || Object.keys(supSA(m, s)).length), SP = hasS ? 3 : 2; // 지원 감독이 있는 날은 열 하나 추가
+  const sCell = (s, room) => (hasS ? (s.spos.includes(`S|${room}`) ? `<td class="cS">${esc(supSA(m, s)[room] || '')}</td>` : '<td><span class="z">-</span></td>') : '');
+  const wNames = s => s.pos.filter(c => c[0] === 'W').map(c => nameOf(s, c)).filter(Boolean).join(', ');
+  const head = `<tr><th rowspan="2" style="width:9mm">학년</th><th rowspan="2">반</th>${S.map(s => `<th colspan="${SP}" class="ph">${s.p}교시 <span style="font-weight:400;font-size:6.5pt">${esc(s.time)}</span></th>`).join('')}</tr><tr>${S.map(() => `<th>제1감독(정)</th><th>제2감독(부)</th>${hasS ? '<th class="cS">지원</th>' : ''}`).join('')}</tr>`;
   const rows = [];
   m.present.forEach(g => {
     const cs = m.classes[g] || [];
     cs.forEach((c, ci) => {
       const room = clsKey(g, c);
       rows.push(`<tr>${ci === 0 ? `<td rowspan="${cs.length}" class="lb">${g}학년</td>` : ''}<td class="lb">${c}반</td>${S.map(s => {
-        if (s.classG.includes(g) && !s.rooms.some(r => r.room === room)) return '<td colspan="2" class="cL">수업</td>';
-        const r = s.rooms.find(x => x.room === room); if (!r) return '<td colspan="2" class="z">-</td>';
-        return `<td>${esc(nameOf(s, `R|${room}|정`))}</td><td>${r.need > 1 ? esc(nameOf(s, `R|${room}|부`)) : '<span class="z">-</span>'}</td>`;
+        if (s.classG.includes(g) && !s.rooms.some(r => r.room === room)) return `<td colspan="${SP}" class="cL">수업</td>`;
+        const r = s.rooms.find(x => x.room === room); if (!r) return `<td colspan="2" class="z">-</td>${sCell(s, room)}`;
+        return `<td>${esc(nameOf(s, `R|${room}|정`))}</td><td>${s.pos.includes(`R|${room}|부`) ? esc(nameOf(s, `R|${room}|부`)) : '<span class="z">-</span>'}</td>${sCell(s, room)}`;
       }).join('')}</tr>`);
     });
   });
-  (m.sup.posts || []).filter(p => p.name).forEach((p, i) => rows.push(`<tr>${i === 0 ? `<td rowspan="${(m.sup.posts || []).filter(x => x.name).length}" class="lb cC">복도</td>` : ''}<td class="lb cC">${esc(p.name)}</td>${S.map(s => `<td colspan="2">${esc(nameOf(s, `C|${p.name}`))}</td>`).join('')}</tr>`));
-  if (+m.sup.standby) rows.push(`<tr><td colspan="2" class="lb">대기</td>${S.map(s => `<td colspan="2" class="cW">${esc(Array.from({ length: +m.sup.standby }, (_, k) => nameOf(s, `W|${k + 1}`)).filter(Boolean).join(', '))}</td>`).join('')}</tr>`);
-  rows.push(`<tr><td colspan="2" class="lb cH">본부 ♣</td>${S.map(s => `<td colspan="2" style="white-space:normal">${esc(m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '))}</td>`).join('')}</tr>`);
+  (m.sup.posts || []).filter(p => p.name).forEach((p, i) => rows.push(`<tr>${i === 0 ? `<td rowspan="${(m.sup.posts || []).filter(x => x.name).length}" class="lb cC">복도</td>` : ''}<td class="lb cC">${esc(p.name)}</td>${S.map(s => `<td colspan="${SP}">${esc(nameOf(s, `C|${p.name}`))}</td>`).join('')}</tr>`));
+  if (S.some(s => s.pos.some(c => c[0] === 'W'))) rows.push(`<tr><td colspan="2" class="lb">대기</td>${S.map(s => `<td colspan="${SP}" class="cW">${esc(wNames(s))}</td>`).join('')}</tr>`);
+  rows.push(`<tr><td colspan="2" class="lb cH">본부 ♣</td>${S.map(s => `<td colspan="${SP}" style="white-space:normal">${esc(m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '))}</td>`).join('')}</tr>`);
   return `<div class="sup fit" style="${supA4Fit(rows.length + 2)}"><div class="ttl">${esc(examTitle)} ${esc(day.md)} 반별 감독표</div><table class="full"><thead>${head}</thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
 function supTeacherHTML(m, examTitle, counts, chk) {
@@ -1401,7 +1499,7 @@ function buildSupWorkbook(m, examTitle, counts) {
     x.alignment = o.align || CEN; if (o.border !== false) x.border = B; if (o.fill) x.fill = XL.fill(o.fill);
     return x;
   };
-  const kindFill = { C: 'FFCDF2E4', H: 'FF42C7F1', X: 'FFFFE7D8', L: 'FFF1F5F9' };
+  const kindFill = { S: 'FFD5F5F0', C: 'FFCDF2E4', H: 'FF42C7F1', X: 'FFFFE7D8', L: 'FFF1F5F9' };
   const codeCell = (cell, r, c, x) => cell(r, c, x.text, { fill: kindFill[x.kind], bold: x.kind === 'W' || x.kind === 'H', color: x.kind === 'W' ? 'FFE00000' : x.kind === 'L' ? 'FF94A3B8' : undefined });
   const sheetName = s => s.replace(/[\\\/\?\*\[\]:]/g, '').slice(0, 31);
   // A4 세로 인쇄 영역의 약 90%를 채우도록 행 높이·열 너비·글씨를 키우거나 줄인다 (제목 1행 제외)
@@ -1461,16 +1559,18 @@ function buildSupWorkbook(m, examTitle, counts) {
     GRADES.forEach((_, k) => { ws.getColumn(R0 + 2 + k).width = 12; });
     fitA4(ws, lastRow, lastCol);
   });
-  // 2) 일자별 반별 감독표
+  // 2) 일자별 반별 감독표 (지원 감독이 있는 날은 교시마다 '지원' 열 추가)
   m.days.forEach(day => {
     const S = day.slots;
     const ws = wb.addWorksheet(sheetName(`${day.dot}_반별감독표`), page());
     const cell = mk(ws);
-    const last = 2 + S.length * 2;
+    const hasS = S.some(s => s.spos.length || Object.keys(supSA(m, s)).length), SP = hasS ? 3 : 2;
+    const col0 = j => 3 + j * SP, last = 2 + S.length * SP;
+    const span = (r, c, v, o) => { ws.mergeCells(r, c, r, c + SP - 1); cell(r, c, v, o); for (let k = 1; k < SP; k++) cell(r, c + k, null, o && o.fill ? { fill: o.fill } : {}); };
     ws.mergeCells(1, 1, 1, last); cell(1, 1, `${examTitle} ${day.md} 반별 감독표`, { size: 16, bold: true, border: false }); ws.getRow(1).height = 30.75;
     ws.mergeCells(2, 1, 3, 1); cell(2, 1, '학년', { bold: true, fill: 'FFE7E6E6' }); cell(3, 1, null, { fill: 'FFE7E6E6' });
     ws.mergeCells(2, 2, 3, 2); cell(2, 2, '반', { bold: true, fill: 'FFE7E6E6' }); cell(3, 2, null, { fill: 'FFE7E6E6' });
-    S.forEach((s, j) => { const c = 3 + j * 2; ws.mergeCells(2, c, 2, c + 1); cell(2, c, `${s.p}교시 ${s.time || ''}`.trim(), { bold: true, fill: 'FFC49DD6' }); cell(2, c + 1, null, { fill: 'FFC49DD6' }); cell(3, c, '제1감독(정)', { bold: true, fill: 'FFE7E6E6' }); cell(3, c + 1, '제2감독(부)', { bold: true, fill: 'FFE7E6E6' }); });
+    S.forEach((s, j) => { const c = col0(j); span(2, c, `${s.p}교시 ${s.time || ''}`.trim(), { bold: true, fill: 'FFC49DD6' }); cell(3, c, '제1감독(정)', { bold: true, fill: 'FFE7E6E6' }); cell(3, c + 1, '제2감독(부)', { bold: true, fill: 'FFE7E6E6' }); if (hasS) cell(3, c + 2, '지원', { bold: true, fill: 'FFD5F5F0' }); });
     const nameOf = (s, code) => m.teachers.filter(t => ((m.sup.assign || {})[s.key] || {})[t.name] === code).map(t => t.name).join(', ');
     let r = 4;
     m.present.forEach(g => {
@@ -1480,20 +1580,23 @@ function buildSupWorkbook(m, examTitle, counts) {
         const room = clsKey(g, c); if (ci) cell(r, 1, null);
         cell(r, 2, `${c}반`, { bold: true });
         S.forEach((s, j) => {
-          const col = 3 + j * 2, rm = s.rooms.find(x => x.room === room);
-          if (!rm) { ws.mergeCells(r, col, r, col + 1); cell(r, col, s.classG.includes(g) ? '수업' : '-', { color: 'FF94A3B8', fill: s.classG.includes(g) ? 'FFF1F5F9' : undefined }); cell(r, col + 1, null); return; }
-          cell(r, col, nameOf(s, `R|${room}|정`)); cell(r, col + 1, rm.need > 1 ? nameOf(s, `R|${room}|부`) : '-', { color: rm.need > 1 ? undefined : 'FFBBBBBB' });
+          const col = col0(j), rm = s.rooms.find(x => x.room === room);
+          const sup3 = () => { if (hasS) { const on = s.spos.includes(`S|${room}`); cell(r, col + 2, on ? (supSA(m, s)[room] || '') : '-', on ? { fill: 'FFD5F5F0' } : { color: 'FFBBBBBB' }); } };
+          if (!rm && s.classG.includes(g)) { span(r, col, '수업', { color: 'FF94A3B8', fill: 'FFF1F5F9' }); return; }
+          if (!rm) { ws.mergeCells(r, col, r, col + 1); cell(r, col, '-', { color: 'FF94A3B8' }); cell(r, col + 1, null); sup3(); return; }
+          const hasB = s.pos.includes(`R|${room}|부`);
+          cell(r, col, nameOf(s, `R|${room}|정`)); cell(r, col + 1, hasB ? nameOf(s, `R|${room}|부`) : '-', { color: hasB ? undefined : 'FFBBBBBB' }); sup3();
         });
         r++;
       });
     });
     const posts = (m.sup.posts || []).filter(p => p.name);
-    posts.forEach(p => { ws.mergeCells(r, 1, r, 2); cell(r, 1, p.name, { bold: true, fill: 'FFCDF2E4' }); cell(r, 2, null, { fill: 'FFCDF2E4' }); S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, nameOf(s, `C|${p.name}`)); cell(r, col + 1, null); }); r++; });
-    if (+m.sup.standby) { ws.mergeCells(r, 1, r, 2); cell(r, 1, '대기', { bold: true }); cell(r, 2, null); S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, Array.from({ length: +m.sup.standby }, (_, k) => nameOf(s, `W|${k + 1}`)).filter(Boolean).join(', '), { color: 'FFE00000', bold: true }); cell(r, col + 1, null); }); r++; }
+    posts.forEach(p => { ws.mergeCells(r, 1, r, 2); cell(r, 1, p.name, { bold: true, fill: 'FFCDF2E4' }); cell(r, 2, null, { fill: 'FFCDF2E4' }); S.forEach((s, j) => span(r, col0(j), nameOf(s, `C|${p.name}`))); r++; });
+    if (S.some(s => s.pos.some(c => c[0] === 'W'))) { ws.mergeCells(r, 1, r, 2); cell(r, 1, '대기', { bold: true }); cell(r, 2, null); S.forEach((s, j) => span(r, col0(j), s.pos.filter(c => c[0] === 'W').map(c => nameOf(s, c)).filter(Boolean).join(', '), { color: 'FFE00000', bold: true })); r++; }
     ws.mergeCells(r, 1, r, 2); cell(r, 1, '본부 ♣', { bold: true, fill: 'FF42C7F1' }); cell(r, 2, null, { fill: 'FF42C7F1' });
-    S.forEach((s, j) => { const col = 3 + j * 2; ws.mergeCells(r, col, r, col + 1); cell(r, col, m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '), { size: 8 }); cell(r, col + 1, null); });
+    S.forEach((s, j) => span(r, col0(j), m.teachers.filter(t => supCell(m, s, t.name).kind === 'H').map(t => t.name).join(', '), { size: 8 }));
     for (let k = 2; k <= r; k++) ws.getRow(k).height = 16.4;
-    ws.getColumn(1).width = 7; ws.getColumn(2).width = 9; S.forEach((_, j) => { ws.getColumn(3 + j * 2).width = 12; ws.getColumn(4 + j * 2).width = 12; });
+    ws.getColumn(1).width = 7; ws.getColumn(2).width = 9; for (let c = 3; c <= last; c++) ws.getColumn(c).width = hasS && (c - 3) % 3 === 2 ? 10 : 12;
     fitA4(ws, r, last);
   });
   // 3) 교사(전체) — 결재용 · 다음 시험 때 '이전 감독 횟수'로 불러올 수 있음
@@ -1528,7 +1631,91 @@ const LIB = {
   h2c: 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
   jspdf: 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
   jszip: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+  pdfjs: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+  pdfjsWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
 };
+/* ---- 교실 배치도: 층·줄·가로 위치 → 지원 감독이 모자랄 때 '가까운 복도 감독' 판단에 사용 ----
+ * layout = { rooms: { '1-5': { f: 층, row: 줄(0부터), x: 가로 위치 } }, office: {f,row,x}|null, src, at } */
+const ROOM_RE = /^([1-3])\s*-\s*(\d{1,2})$/;
+function layoutFromTokens(tokens) { // tokens: [{t, x, y}] (y는 위에서 아래로 커짐)
+  const floors = [];
+  tokens.forEach((k, i) => {
+    let m = k.t.match(/^([1-9])\s*층$/); if (m) { floors.push({ f: +m[1], y: k.y }); return; }
+    if (k.t === '층') { const d = tokens.filter(o => /^[1-9]$/.test(o.t) && Math.abs(o.y - k.y) < 8 && k.x - o.x > -2 && k.x - o.x < 30).sort((a, b) => (k.x - a.x) - (k.x - b.x))[0]; if (d) floors.push({ f: +d.t, y: Math.min(d.y, k.y) }); }
+  });
+  floors.sort((a, b) => a.y - b.y);
+  const floorAt = y => { let f = null; floors.forEach(o => { if (o.y <= y + 12) f = o.f; }); return f; };
+  const rooms = {}; let office = null;
+  tokens.forEach(k => {
+    const m = k.t.match(ROOM_RE);
+    if (m) { const f = floorAt(k.y); if (f != null) rooms[`${m[1]}-${+m[2]}`] = { f, y: k.y, x: Math.round(k.x) }; }
+    else if (!office && /교무실/.test(k.t)) { const f = floorAt(k.y); if (f != null) office = { f, y: k.y, x: Math.round(k.x) }; }
+  });
+  // 같은 층 안에서 세로 위치가 다르면 다른 줄(복도 맞은편·다른 동)로 본다
+  const byF = {}; Object.values(rooms).forEach(r => { (byF[r.f] = byF[r.f] || []).push(r.y); });
+  const rowOf = (f, y) => { const ys = [...new Set((byF[f] || []).map(v => Math.round(v / 20)))].sort((a, b) => a - b); return Math.max(0, ys.indexOf(Math.round(y / 20))); };
+  Object.values(rooms).forEach(r => { r.row = rowOf(r.f, r.y); delete r.y; });
+  if (office) { office.row = rowOf(office.f, office.y); delete office.y; }
+  return { rooms, office, floors: floors.map(o => o.f) };
+}
+async function parseLayoutPDF(buf) {
+  await loadScript(LIB.pdfjs);
+  const lib = window.pdfjsLib; lib.GlobalWorkerOptions.workerSrc = LIB.pdfjsWorker;
+  const doc = await lib.getDocument({ data: new Uint8Array(buf) }).promise;
+  let best = null;
+  for (let n = 1; n <= Math.min(doc.numPages, 10); n++) {
+    const page = await doc.getPage(n), vp = page.getViewport({ scale: 1 }), tc = await page.getTextContent();
+    const tokens = [];
+    tc.items.forEach(it => {
+      const str = String(it.str || ''); if (!str.trim()) return;
+      const x0 = it.transform[4], y = vp.height - it.transform[5], w = it.width || 0, len = str.length;
+      // 한 덩어리에 여러 낱말이 있으면 글자 위치 비율로 가로 위치를 나눈다
+      let i = 0; str.split(/(\s+)/).forEach(part => { if (part.trim()) tokens.push({ t: part.trim(), x: x0 + (len ? (w * i) / len : 0), y }); i += part.length; });
+    });
+    const L = layoutFromTokens(tokens);
+    if (!best || Object.keys(L.rooms).length > Object.keys(best.rooms).length) best = L;
+  }
+  return best;
+}
+// 엑셀 양식: 층 | 줄 | 순서(왼쪽→오른쪽) | 교실 (교무실 = 대기 감독 위치)
+function parseLayoutXlsx(wb) {
+  const rooms = {}; let office = null;
+  wb.SheetNames.forEach(n => {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '', raw: false });
+    let h = -1, ci = {};
+    for (let r = 0; r < Math.min(rows.length, 10) && h < 0; r++) {
+      const row = rows[r].map(v => String(v).replace(/\s+/g, ''));
+      const f = row.findIndex(v => /^층/.test(v)), c = row.findIndex(v => /^교실/.test(v));
+      if (f >= 0 && c >= 0) { h = r; ci = { f, c, row: row.findIndex(v => /^줄/.test(v)), o: row.findIndex(v => /^순서/.test(v)) }; }
+    }
+    if (h < 0) return;
+    rows.slice(h + 1).forEach((r, i) => {
+      const f = parseInt(String(r[ci.f]).replace(/[^\d]/g, ''), 10), name = String(r[ci.c] || '').replace(/\s+/g, '');
+      if (!f || !name) return;
+      const row = ci.row >= 0 ? Math.max(0, (parseInt(r[ci.row], 10) || 1) - 1) : 0, x = (ci.o >= 0 ? (parseFloat(r[ci.o]) || i + 1) : i + 1) * 50;
+      const m = name.match(ROOM_RE);
+      if (m) rooms[`${m[1]}-${+m[2]}`] = { f, row, x }; else if (/교무실/.test(name)) office = { f, row, x };
+    });
+  });
+  return { rooms, office };
+}
+function buildLayoutTemplate(layout, classesByGrade) {
+  const wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet('교실 배치도');
+  ws.mergeCells('A1:E1'); ws.getCell('A1').value = '교실 배치도 — 층·줄·순서(왼쪽→오른쪽)를 적으세요. 교무실은 대기 감독 위치입니다.'; ws.getCell('A1').font = XL.font(11, true);
+  ['층', '줄', '순서', '교실', '비고'].forEach((t, i) => { const c = ws.getCell(2, i + 1); c.value = t; c.font = XL.font(10, true); c.fill = XL.fill('FFE7E6E6'); c.border = XL.border; c.alignment = { horizontal: 'center' }; });
+  const L = layout && Object.keys(layout.rooms || {}).length ? layout : null;
+  let list = [];
+  if (L) {
+    const byKey = {}; Object.entries(L.rooms).forEach(([k, v]) => { const g = `${v.f}|${v.row}`; (byKey[g] = byKey[g] || []).push([k, v]); });
+    Object.keys(byKey).sort((a, b) => b.split('|')[0] - a.split('|')[0] || a.split('|')[1] - b.split('|')[1]).forEach(g => byKey[g].sort((a, b) => a[1].x - b[1].x).forEach(([k, v], i) => list.push([v.f, v.row + 1, i + 1, k])));
+    if (L.office) list.push([L.office.f, L.office.row + 1, '', '교무실']);
+  } else list = GRADES.flatMap(g => (classesByGrade[g] || []).map((c, i) => ['', 1, i + 1, clsKey(g, c)])).concat([['', 1, '', '교무실']]);
+  list.forEach((r, i) => r.forEach((v, k) => { const c = ws.getCell(3 + i, k + 1); c.value = v === '' ? null : v; c.border = XL.border; c.alignment = { horizontal: 'center' }; }));
+  [8, 8, 8, 12, 24].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+  return wb;
+}
+// 거리: 층이 다르면 크게, 같은 층 다른 줄이면 조금 더
+const layDist = (a, b) => Math.abs(a.f - b.f) * 1000 + Math.abs(a.x - b.x) + (a.f === b.f && a.row != null && b.row != null && a.row !== b.row ? 60 : 0);
 async function pagesToPdf(pages, onProgress) {
   await loadScript(LIB.h2c); await loadScript(LIB.jspdf);
   const { jsPDF } = window.jspdf;
@@ -2670,7 +2857,7 @@ function StatsTab({ sx, D, setThr, setTimes, setEditor, setRoom, resetRooms, cla
 }
 
 /* ------------------------------ 감독 시간표 탭 (관리자) ------------------------------ */
-const SUP_KIND_CLS = { R: 'bg-white', C: 'bg-emerald-100 text-emerald-900', W: 'bg-white text-red-600 font-bold', H: 'bg-sky-300 text-sky-950 font-bold', X: 'bg-orange-100 text-orange-800', L: 'bg-slate-100 text-slate-400', '': 'bg-white' };
+const SUP_KIND_CLS = { S: 'bg-teal-50 text-teal-800 font-semibold', R: 'bg-white', C: 'bg-emerald-100 text-emerald-900', W: 'bg-white text-red-600 font-bold', H: 'bg-sky-300 text-sky-950 font-bold', X: 'bg-orange-100 text-orange-800', L: 'bg-slate-100 text-slate-400', '': 'bg-white' };
 function SupBox({ title, sub, children, id }) {
   return html`<div className="border border-slate-200 rounded-xl p-3.5" id=${id}><div className="text-sm font-bold text-slate-800">${title}</div>${sub && html`<p className="text-[11px] text-slate-500 mt-0.5 mb-2">${sub}</p>`}${children}</div>`;
 }
@@ -2688,56 +2875,131 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   const examOpts = GRADES.flatMap(g => m.examSubs[g].map(sub => ({ k: `${g}|${norm(sub)}`, label: `${g}학년 ${sub}` })));
   const labelOfKey = k => (examOpts.find(o => o.k === k) || { label: k.replace('|', '학년 ') }).label;
   const nAssigned = Object.values(sup.assign || {}).reduce((a, o) => a + Object.keys(o).length, 0);
-  const nPos = m.slots.reduce((a, s) => a + s.pos.length, 0);
+  const nSPos = m.slots.reduce((a, s) => a + s.spos.length, 0);
+  const nPos = m.slots.reduce((a, s) => a + s.pos.length + s.spos.length, 0);
+  const nForced = m.slots.reduce((a, s) => a + s.nAdd + s.nOff, 0);
   const homeDup = (() => { const c = {}; m.teachers.forEach(t => { if (t.home) c[t.home] = (c[t.home] || 0) + 1; }); return Object.keys(c).filter(k => c[k] > 1); })();
   const shown = m.teachers.filter(t => !q || t.name.includes(q.trim()));
 
   const generate = () => {
     if (!m.teachers.length) { say('교사 주간시간표를 먼저 올리세요.', 'error'); return; }
     if (!m.slots.length) { say('시험 시간표가 비어 있습니다. 시험 시간표를 먼저 입력하세요.', 'error'); return; }
-    if (nAssigned && !confirm('지금 편성표(직접 바꾼 내용 포함)를 지우고 처음부터 자동 편성할까요?')) return;
-    const a = supGenerate(m);
-    const c2 = supCheck({ ...m, sup: { ...m.sup, assign: a } });
-    const k2 = supCounts({ ...m, sup: { ...m.sup, assign: a } });
+    if (nAssigned && !confirm('지금 편성표(직접 바꾼 내용 포함)를 지우고 처음부터 자동 편성할까요?\n(강제로 더하거나 없앤 자리는 그대로 둡니다)')) return;
+    const a = supGenerate(m), sa = supGenSupport(m, a);
+    const m2 = { ...m, sup: { ...m.sup, assign: a, sassign: sa } };
+    const c2 = supCheck(m2), k2 = supCounts(m2);
     const act = m.teachers.filter(t => (t.ex || {}).mode !== 'all').map(t => k2[t.name].load);
-    upd(x => { x.assign = a; x.genAt = new Date().toLocaleString('ko-KR'); });
+    upd(x => { x.assign = a; x.sassign = sa; x.genAt = new Date().toLocaleString('ko-KR'); });
     setView('grid'); setPick(null);
-    say(`⚙ 자동 편성 완료 — 감독 자리 ${nPos - c2.nMiss}/${nPos}개 배치${c2.nMiss ? ` · ⚠ 사람이 모자라 비어 있는 자리 ${c2.nMiss}개` : ''} · 교사별 이번 감독+수업 ${act.length ? Math.min(...act) : 0}~${act.length ? Math.max(...act) : 0}회 · 3교시 연속 ${c2.warn3.length}건`, c2.nMiss ? 'error' : 'success');
+    say(`⚙ 자동 편성 완료 — 감독 자리 ${nPos - c2.nMiss}/${nPos}개 배치${nSPos ? ` (지원 감독 ${nSPos}자리 포함)` : ''}${c2.nMiss ? ` · ⚠ 사람이 모자라 비어 있는 자리 ${c2.nMiss}개` : ''} · 교사별 이번 감독+수업 ${act.length ? Math.min(...act) : 0}~${act.length ? Math.max(...act) : 0}회 · 3교시 연속 ${c2.warn3.length}건`, c2.nMiss ? 'error' : 'success');
   };
-  // 같은 교시(열) 안에서 1:1 맞바꾸기 · 미배정 자리 넣기 · 자리 비우기
+  const regenSupport = () => {
+    const sa = supGenSupport(m, sup.assign || {});
+    const c2 = supCheck({ ...m, sup: { ...m.sup, sassign: sa } });
+    upd(x => { x.sassign = sa; });
+    const left = Object.values(c2.unfilled).flat().filter(c => c[0] === 'S').length;
+    say(`🤝 지원 감독 자동 배정 — ${nSPos - left}/${nSPos}자리${left ? ` · ⚠ 비어 있는 지원 자리 ${left}개` : ''} (1·2감독·복도·대기 편성은 그대로)`, left ? 'error' : 'success');
+  };
+  // 같은 교시(열) 안에서 1:1 맞바꾸기(지원 감독도 함께 이동) · 미배정 자리 넣기 · 자리 비우기
   const act = (src, dst) => {
     if (!src || !dst) return;
     if (src.k !== dst.k) { say('⛔ 같은 시험 교시(같은 열) 안에서만 바꿀 수 있습니다.', 'error'); return; }
     const s = m.slots.find(x => x.key === src.k); if (!s) return;
-    const A = { ...((sup.assign || {})[s.key] || {}) };
+    const A = { ...((sup.assign || {})[s.key] || {}) }, SA = { ...((sup.sassign || {})[s.key] || {}) };
+    const sOf = n => Object.keys(SA).filter(r => SA[r] === n);
     let msg = '';
     if (src.t && dst.t) {
       if (src.t === dst.t) return;
-      const ca = A[src.t] || '', cb = A[dst.t] || '';
-      if (!ca && !cb) return;
-      const err = (cb && supCan(m, s, src.t, cb)) || (ca && supCan(m, s, dst.t, ca));
+      const ca = A[src.t] || '', cb = A[dst.t] || '', sa = sOf(src.t), sb = sOf(dst.t);
+      if (!ca && !cb && !sa.length && !sb.length) return;
+      const err = (cb && supCan(m, s, src.t, cb)) || (ca && supCan(m, s, dst.t, ca))
+        || sb.map(r => supCanS(m, s, src.t, r, cb)).find(Boolean) || sa.map(r => supCanS(m, s, dst.t, r, ca)).find(Boolean);
       if (err) { say(`⛔ 바꿀 수 없습니다 — ${err}`, 'error'); return; }
       if (cb) A[src.t] = cb; else delete A[src.t];
       if (ca) A[dst.t] = ca; else delete A[dst.t];
-      msg = cb && ca ? `${src.t}(${supText(cb)}) ↔ ${dst.t}(${supText(ca)}) 맞바꿈` : `${ca ? dst.t : src.t} 선생님이 ${supText(ca || cb)}을(를) 맡음`;
+      sa.forEach(r => { SA[r] = dst.t; }); sb.forEach(r => { SA[r] = src.t; });
+      const lab = (c, l) => [c && supText(c), ...l.map(r => `지원 ${r}`)].filter(Boolean).join('+') || '빈칸';
+      msg = `${src.t}(${lab(ca, sa)}) ↔ ${dst.t}(${lab(cb, sb)}) 맞바꿈`;
     } else if (src.code && dst.t) {
-      const err = supCan(m, s, dst.t, src.code);
-      if (err) { say(`⛔ 넣을 수 없습니다 — ${err}`, 'error'); return; }
-      const prev = A[dst.t]; A[dst.t] = src.code;
-      msg = `${dst.t} 선생님 → ${supText(src.code)}${prev ? ` (원래 맡던 ${supText(prev)}는 미배정으로)` : ''}`;
+      if (src.code[0] === 'S') {
+        const room = src.code.split('|')[1], err = supCanS(m, s, dst.t, room, A[dst.t] || '') || (sOf(dst.t).length ? `${dst.t} 선생님은 이미 지원 감독(${sOf(dst.t).join(', ')})을 맡고 있습니다.` : null);
+        if (err) { say(`⛔ 넣을 수 없습니다 — ${err}`, 'error'); return; }
+        SA[room] = dst.t; msg = `${dst.t} 선생님 → 지원 ${room}${A[dst.t] ? ` (${supText(A[dst.t])}와 겸함)` : ''}`;
+      } else {
+        const err = supCan(m, s, dst.t, src.code) || (src.code[0] === 'R' && sOf(dst.t).length ? `${dst.t} 선생님은 지원 감독(${sOf(dst.t).join(', ')}) 중이라 교실 감독을 겸할 수 없습니다. 지원 감독을 먼저 비우세요.` : null);
+        if (err) { say(`⛔ 넣을 수 없습니다 — ${err}`, 'error'); return; }
+        const prev = A[dst.t]; A[dst.t] = src.code;
+        msg = `${dst.t} 선생님 → ${supText(src.code)}${prev ? ` (원래 맡던 ${supText(prev)}는 미배정으로)` : ''}`;
+      }
     } else if (src.t && dst.zone) {
-      const prev = A[src.t]; if (!prev) return; delete A[src.t];
-      msg = `${src.t} 선생님의 ${supText(prev)} 자리를 비움 (미배정)`;
+      const prev = A[src.t], sr = sOf(src.t);
+      if (prev) { delete A[src.t]; msg = `${src.t} 선생님의 ${supText(prev)} 자리를 비움 (미배정)`; }
+      else if (sr.length) { sr.forEach(r => { delete SA[r]; }); msg = `${src.t} 선생님의 지원 ${sr.join(', ')} 자리를 비움 (미배정)`; }
+      else return;
     } else return;
-    upd(x => { x.assign = { ...(x.assign || {}), [s.key]: A }; });
+    upd(x => { x.assign = { ...(x.assign || {}), [s.key]: A }; x.sassign = { ...(x.sassign || {}), [s.key]: SA }; });
     say(`✓ ${s.md} ${s.p}교시: ${msg}`);
   };
   const clickCell = target => {
-    if (!pick) { if (target.code || (target.t && ((sup.assign || {})[target.k] || {})[target.t])) setPick(target); return; }
+    if (!pick) { setPick(target); return; }
     const same = pick.k === target.k && pick.t === target.t && pick.code === target.code;
     if (!same) act(pick, target);
     setPick(null);
   };
+  // 강제 배정·삭제 (부감독·대기·지원): 자리 자체를 더하거나 없앤다
+  const forceOff = (k, code) => upd(x => {
+    const add = ((x.posAdd || {})[k] || []);
+    if (add.includes(code)) x.posAdd = { ...(x.posAdd || {}), [k]: add.filter(c => c !== code) };
+    else x.posOff = { ...(x.posOff || {}), [k]: [...new Set([...((x.posOff || {})[k] || []), code])] };
+    const A = (x.assign || {})[k] || {}; Object.keys(A).forEach(n => { if (A[n] === code) delete A[n]; });
+    if (code[0] === 'S') { const SA = (x.sassign || {})[k] || {}; delete SA[code.split('|')[1]]; }
+  });
+  const forceAdd = (s, t, code) => {
+    const A = (sup.assign || {})[s.key] || {};
+    if (code[0] === 'S') {
+      const room = code.split('|')[1], err = supCanS(m, s, t, room, A[t] || '') || (supRoomsOf(m, s, t).length ? `${t} 선생님은 이미 지원 감독을 맡고 있습니다.` : null);
+      if (err) { say(`⛔ 배정할 수 없습니다 — ${err}`, 'error'); return; }
+    } else {
+      if (A[t]) { say(`⛔ ${t} 선생님은 이미 ${supText(A[t])}을(를) 맡고 있습니다. 먼저 비우세요.`, 'error'); return; }
+      const err = supCan(m, s, t, code) || (code[0] === 'R' && supRoomsOf(m, s, t).length ? `${t} 선생님은 지원 감독 중이라 교실 감독을 겸할 수 없습니다.` : null);
+      if (err) { say(`⛔ 배정할 수 없습니다 — ${err}`, 'error'); return; }
+    }
+    upd(x => {
+      const off = (x.posOff || {})[s.key] || [];
+      if (off.includes(code)) x.posOff = { ...x.posOff, [s.key]: off.filter(c => c !== code) };
+      else if (!(code[0] === 'S' ? s.spos : s.pos).includes(code)) x.posAdd = { ...(x.posAdd || {}), [s.key]: [...((x.posAdd || {})[s.key] || []), code] };
+      if (code[0] === 'S') x.sassign = { ...(x.sassign || {}), [s.key]: { ...((x.sassign || {})[s.key] || {}), [code.split('|')[1]]: t } };
+      else x.assign = { ...(x.assign || {}), [s.key]: { ...((x.assign || {})[s.key] || {}), [t]: code } };
+    });
+    setPick(null);
+    say(`✓ ${s.md} ${s.p}교시: ${t} 선생님 → ${supText(code)} (강제 배정)`);
+  };
+  // 교실 배치도 올리기 (PDF 그대로 또는 엑셀 양식)
+  const onLayout = async e => {
+    const file = e.target.files && e.target.files[0]; e.target.value = ''; if (!file) return;
+    try {
+      say('교실 배치도 읽는 중...', 'info');
+      const buf = await file.arrayBuffer();
+      const L = /\.pdf$/i.test(file.name) ? await parseLayoutPDF(buf) : parseLayoutXlsx(XLSX.read(buf, { type: 'array' }));
+      const n = L ? Object.keys(L.rooms).length : 0;
+      if (!n) { say("교실 배치도에서 교실 번호('1-5' 형식)를 찾지 못했습니다. 글자가 들어 있는 PDF(한글에서 PDF로 인쇄)이거나 [배치도 엑셀 양식]인지 확인하세요.", 'error'); return; }
+      const all = GRADES.flatMap(g => (classesByGrade[g] || []).map(c => clsKey(g, c))), miss = all.filter(k => !L.rooms[k]);
+      upd(x => { x.layout = { rooms: L.rooms, office: L.office || null, src: file.name, at: new Date().toLocaleString('ko-KR') }; });
+      const fl = [...new Set(Object.values(L.rooms).map(r => r.f))].sort((a, b) => b - a);
+      say(`🗺 교실 배치도 적용: 교실 ${n}개 (${fl.map(f => `${f}층`).join('·')})${L.office ? ' · 교무실 위치 인식' : ''}${miss.length ? ` · 배치도에 없는 교실 ${miss.length}개: ${miss.slice(0, 10).join(', ')}` : ''}`, miss.length ? 'error' : 'success');
+    } catch (err) { console.error(err); say(`교실 배치도 읽기 오류: ${err.message}`, 'error'); }
+  };
+  // 배치도 한 줄(층·줄)을 직접 고치기: '1-6, 1-5, 1-4' → 왼쪽부터 같은 간격으로 놓음
+  const editLayoutRow = (f, row, text) => upd(x => {
+    const R0 = { ...((x.layout || {}).rooms || {}) };
+    Object.keys(R0).forEach(k => { if (R0[k].f === f && R0[k].row === row) delete R0[k]; });
+    text.split(/[,·\s]+/).map(v => v.trim()).filter(v => ROOM_RE.test(v)).forEach((v, i) => { const mm = v.match(ROOM_RE); R0[`${mm[1]}-${+mm[2]}`] = { f, row, x: 50 + i * 50 }; });
+    x.layout = { ...(x.layout || {}), rooms: R0, edited: true };
+  });
+  const resetForced = k => upd(x => {
+    const keys = k ? [k] : Object.keys({ ...(x.posAdd || {}), ...(x.posOff || {}) });
+    keys.forEach(kk => { if (x.posAdd) delete x.posAdd[kk]; if (x.posOff) delete x.posOff[kk]; });
+  });
   const dnd = target => ({
     onDragOver: e => { if (dragRef.current) e.preventDefault(); },
     onDrop: e => { e.preventDefault(); const src = dragRef.current; dragRef.current = null; if (src) act(src, target); },
@@ -2841,6 +3103,29 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
       <div className="space-y-1.5">${(examPs.length ? examPs : [1, 2, 3]).map(p => html`<div key=${p} className="flex flex-wrap items-center gap-1.5 text-xs"><span className="w-14 font-bold">시험 ${p}교시</span><span className="text-slate-400">→ 수업</span>
         ${Array.from({ length: maxCP }, (_, i) => i + 1).map(cp => { const on = ((sup.pmap || {})[p] || [p]).includes(cp); return html`<label key=${cp} className=${`px-1.5 py-0.5 rounded border cursor-pointer ${on ? 'bg-indigo-600 text-white border-indigo-600' : 'border-slate-300 text-slate-500'}`}><input type="checkbox" className="hidden" data-pmap=${`${p}-${cp}`} checked=${on} onChange=${e => upd(x => { const cur = ((x.pmap || {})[p] || [p]).filter(v => v !== cp); x.pmap = { ...(x.pmap || {}), [p]: e.target.checked ? [...cur, cp].sort((a, b) => a - b) : cur }; })} />${cp}</label>`; })}</div>`)}</div>
     <//>
+    <${SupBox} id="supSupport" title="지원 감독 배정 (일차·교시·학년)" sub="체크한 교시에 그 학년의 모든 교실(응시 인원 0명 교실 포함)에 지원 감독 1명을 둡니다. 남는 교사를 먼저 배정하고, 모자라면 그 교실과 가까운 복도 감독(위치 설명의 'N학년 N반' 기준)이나 대기 감독이 겸합니다. 지원 감독은 감독 횟수에 넣지 않습니다.">
+      ${!m.slots.length ? html`<p className="text-xs text-slate-400">시험 시간표가 없습니다.</p>` : html`<table className="w-full text-xs border-collapse"><thead><tr className="bg-slate-50"><th className="border border-slate-200 p-1">일차·교시</th>${GRADES.map(g => html`<th key=${g} className="border border-slate-200">${g}학년 <button title="모든 교시 켜기/끄기" data-support-all=${g} onClick=${() => upd(x => { const on = !m.slots.every(s2 => s2.classG.includes(g) || (x.support || {})[`${s2.d}-${s2.p}-${g}`]); const o = { ...(x.support || {}) }; m.slots.forEach(s2 => { if (!s2.classG.includes(g)) o[`${s2.d}-${s2.p}-${g}`] = on; }); x.support = o; })} className="ml-1 text-[10px] underline text-teal-700">전체</button></th>`)}</tr></thead>
+        <tbody>${m.slots.map(s2 => html`<tr key=${s2.key}><td className="border border-slate-200 p-1 text-center font-semibold whitespace-nowrap">${s2.sh} ${s2.p}교시</td>
+          ${GRADES.map(g => { const k = `${s2.d}-${s2.p}-${g}`, dis = s2.classG.includes(g); return html`<td key=${g} className=${`border border-slate-200 text-center ${(sup.support || {})[k] && !dis ? 'bg-teal-50' : ''}`}>${dis ? html`<span className="text-[10px] text-slate-400">수업</span>` : html`<input type="checkbox" data-support=${k} checked=${!!(sup.support || {})[k]} onChange=${e => upd(x => { x.support = { ...(x.support || {}), [k]: e.target.checked }; })} />`}</td>`; })}</tr>`)}</tbody></table>
+        <p className="text-[11px] text-slate-500 mt-1.5">지원 감독 자리: ${nSPos}개 · 설정을 바꾼 뒤 편성표의 [🤝 지원 감독만 다시 배정]을 누르면 1·2감독 편성은 그대로 두고 지원 감독만 새로 배정합니다.</p>`}
+    <//>
+    <div className="lg:col-span-2"><${SupBox} id="supLayout" title="교실 배치도 (지원 감독의 '가까운 복도·대기 감독' 판단)" sub="해마다 교실 위치가 바뀌면 새 배치도를 올리세요. 한글에서 PDF로 인쇄한 배치도를 그대로 올리면 층·줄·교실 위치를 읽습니다. 엑셀 양식(층·줄·순서·교실)도 됩니다. 복도 위치는 이름의 'N층'과 설명의 'N학년 N반'으로 자리를 잡습니다.">
+      <div className="flex flex-wrap items-center gap-1.5 mb-2">
+        <label className=${`${pbtn} bg-teal-700 text-white cursor-pointer`}>⬆ 배치도 올리기 (PDF·엑셀)<input id="supLayoutInput" type="file" accept=".pdf,.xlsx,.xls" onChange=${onLayout} className="hidden" /></label>
+        <button id="supLayoutTpl" onClick=${async () => { await downloadWorkbook(buildLayoutTemplate(sup.layout, classesByGrade), '교실배치도_양식.xlsx'); say('📥 교실 배치도 엑셀 양식 — 지금 배치도가 있으면 채워져 있습니다.'); }} className=${`${pbtn} bg-white text-slate-700 border border-slate-300`}>⬇ 배치도 엑셀 양식</button>
+        ${sup.layout && html`<button onClick=${() => { if (confirm('교실 배치도를 지울까요? (지원 감독은 복도 설명만으로 가까운 곳을 고릅니다)')) upd(x => { x.layout = null; }); }} className="text-[11px] px-2 py-1 rounded border border-rose-200 text-rose-600">지우기</button>`}
+        ${sup.layout && html`<span className="text-[11px] text-slate-500">${sup.layout.src || ''}${sup.layout.edited ? ' (직접 고침)' : ''} · ${sup.layout.at || ''}</span>`}
+      </div>
+      ${!sup.layout || !Object.keys(sup.layout.rooms || {}).length ? html`<p className="text-xs text-slate-400">배치도가 없으면 복도 위치 설명(예: '1학년 10,11반')만으로 가까운 복도 감독을 고릅니다.</p>` : (() => {
+        const LY = sup.layout.rooms, keys = [...new Set(Object.values(LY).map(r => `${r.f}|${r.row}`))].sort((a, b) => b.split('|')[0] - a.split('|')[0] || a.split('|')[1] - b.split('|')[1]);
+        const all = GRADES.flatMap(g => (classesByGrade[g] || []).map(c => clsKey(g, c))), miss = all.filter(k => !LY[k]);
+        return html`<div className="space-y-1" id="supLayoutRows">${keys.map(k => { const [f, row] = k.split('|').map(Number), list = Object.keys(LY).filter(r => LY[r].f === f && LY[r].row === row).sort((a, b) => LY[a].x - LY[b].x);
+          return html`<div key=${k} className="flex items-center gap-2 text-xs"><span className="w-16 font-bold text-slate-700">${f}층${keys.filter(x => +x.split('|')[0] === f).length > 1 ? ` ${row + 1}줄` : ''}</span>
+            <input data-layout-row=${k} defaultValue=${list.join(', ')} key=${list.join(',')} onBlur=${e => { if (e.target.value.replace(/\s/g, '') !== list.join(',')) editLayoutRow(f, row, e.target.value); }} className="flex-1 border border-slate-300 rounded px-2 py-1 font-mono" title="왼쪽 → 오른쪽 순서. 고친 뒤 칸 밖을 누르면 적용됩니다." /></div>`; })}
+          <p className="text-[11px] text-slate-500">${sup.layout.office ? `교무실(대기 감독): ${sup.layout.office.f}층` : '교무실 위치 없음 (대기 감독은 복도 감독 다음 순서로만 겸함)'}${miss.length ? html` · <span className="text-rose-600 font-semibold">배치도에 없는 교실: ${miss.join(', ')}</span>` : ''}</p>
+          <p className="text-[11px] text-slate-500">복도 위치 → ${(sup.posts || []).filter(p => p.name).map(p => { const pl = (m.postLoc || {})[p.name]; return `${p.name}: ${pl ? `${pl.f}층${(m.postArea[p.name] || []).length ? ' (설명의 교실 근처)' : ' (층 가운데)'}` : '층을 알 수 없음'}`; }).join(' · ')}</p></div>`;
+      })()}
+    <//></div>
     <${SupBox} id="supPosts" title="복도 감독 위치" sub="같은 과목 시험 교사를 먼저 복도에 배치하고, ★(고사본부 앞) 위치를 가장 먼저 채웁니다. 남는 자리는 다른 교사로 채웁니다.">
       <div className="space-y-1">${(sup.posts || []).map((p, i) => html`<div key=${i} className="flex items-center gap-1.5 text-xs">
         <button title="고사본부 앞 (같은 과목 교사 우선)" onClick=${() => upd(x => { x.posts[i].hq = !x.posts[i].hq; })} className=${`w-6 h-6 rounded ${p.hq ? 'bg-amber-400 text-slate-900' : 'bg-slate-100 text-slate-300'}`}>★</button>
@@ -2869,14 +3154,46 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
   const cntCls = d => (d ? 'hidden xl:table-cell' : '');
   const minW = 88 + S.length * 52 + 2 * 34;
   const dl = i => (i > 0 && S[i - 1].d !== S[i].d ? 'border-l-2 border-l-slate-800' : '');
+  // 선택한 칸에 대한 작업: 맞바꾸기 안내 + 강제 배정·삭제 (부감독·대기·지원)
+  const pickBar = (() => {
+    if (!pick) return null;
+    const s = m.slots.find(x => x.key === pick.k); if (!s) return null;
+    const A = (sup.assign || {})[s.key] || {}, SA = supSA(m, s);
+    const B = 'px-2 py-1 rounded-md border text-[11px] font-semibold';
+    const items = [];
+    const delBtn = code => html`<button key=${'d' + code} data-force-off=${code} onClick=${() => { forceOff(s.key, code); setPick(null); say(`🗑 ${s.md} ${s.p}교시 '${supText(code)}' 자리를 없앴습니다. (강제 삭제)`); }} className=${`${B} border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100`}>🗑 '${supText(code)}' 자리 없애기</button>`;
+    if (pick.code) { if (/^[WS]\|/.test(pick.code) || /\|부$/.test(pick.code)) items.push(delBtn(pick.code)); }
+    else if (pick.t) {
+      const code = A[pick.t] || '', sr = supRoomsOf(m, s, pick.t);
+      if (code && (code[0] === 'W' || /\|부$/.test(code))) items.push(delBtn(code));
+      sr.forEach(r => items.push(delBtn(`S|${r}`)));
+      if (!code) {
+        const subRooms = s.rooms.filter(r => !s.pos.includes(`R|${r.room}|부`)).map(r => r.room);
+        items.push(html`<select key="fsub" data-force-sub=${pick.t} value="" onChange=${e => { if (e.target.value) forceAdd(s, pick.t, `R|${e.target.value}|부`); }} className=${`${B} border-slate-300 bg-white`}><option value="">+ 부감독 강제 배정 ▾</option>${subRooms.map(r => html`<option key=${r} value=${r}>${r}(부)</option>`)}</select>`);
+        const nextW = Math.max(0, ...s.pos.filter(c => c[0] === 'W').map(c => +c.split('|')[1])) + 1;
+        items.push(html`<button key="fw" data-force-w=${pick.t} onClick=${() => forceAdd(s, pick.t, `W|${nextW}`)} className=${`${B} border-red-200 bg-white text-red-600 hover:bg-red-50`}>+ 대기${nextW} 강제 배정</button>`);
+      }
+      if (!sr.length && !(code && code[0] === 'R')) {
+        const sRooms = GRADES.filter(g => !s.classG.includes(g)).flatMap(g => (m.classes[g] || []).map(c => clsKey(g, c))).filter(r => !SA[r]);
+        items.push(html`<select key="fs" data-force-s=${pick.t} value="" onChange=${e => { if (e.target.value) forceAdd(s, pick.t, `S|${e.target.value}`); }} className=${`${B} border-teal-300 bg-teal-50 text-teal-800`}><option value="">+ 지원 감독 강제 배정 ▾</option>${sRooms.map(r => html`<option key=${r} value=${r}>지원 ${r}${s.spos.includes(`S|${r}`) ? ' (빈 자리)' : ''}</option>`)}</select>`);
+      }
+    }
+    if (s.nAdd || s.nOff) items.push(html`<button key="rs" onClick=${() => { resetForced(s.key); setPick(null); }} className=${`${B} border-violet-300 bg-violet-50 text-violet-800`}>↺ 이 교시 강제 변경 되돌리기 (${s.nAdd + s.nOff})</button>`);
+    return html`<div id="supPickBar" className="flex flex-wrap items-center gap-1.5 mb-2 px-2.5 py-2 rounded-lg bg-indigo-50 border border-indigo-200 text-xs">
+      <span className="font-semibold text-indigo-800">선택: ${s.md} ${s.p}교시 · ${pick.t ? `${pick.t} 선생님` : `빈 자리 '${supText(pick.code)}'`}</span>
+      <span className="text-indigo-600">→ 같은 열의 다른 칸을 누르면 맞바꿉니다.</span>${items}
+      <button onClick=${() => setPick(null)} className="ml-auto underline text-indigo-700">선택 취소</button></div>`;
+  })();
   const gridView = html`<div>
     <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
       <input value=${q} onInput=${e => setQ(e.target.value)} placeholder="🔍 이름 찾기" className="border border-slate-300 rounded-md px-2 py-1 w-32" />
       <span className="text-slate-500 basis-full lg:basis-auto">칸을 <b>끌어서 같은 열의 다른 교사 칸에 놓으면</b> 두 사람의 자리가 맞바뀝니다. (또는 두 칸을 차례로 클릭) 규칙에 어긋나면 바뀌지 않고 이유를 알려 줍니다. 맨 아래 <b>미배정</b> 줄로 끌면 자리를 비웁니다.</span>
       <${Seg} value=${gridDay} onChange=${setGridDay} options=${[['all', '전체 일정'], ...m.days.map((d, i) => [i, d.sh])]} size="xs" />
-      ${pick && html`<span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-semibold">선택됨: ${pick.t || supText(pick.code)} — 바꿀 칸을 누르세요 <button onClick=${() => setPick(null)} className="underline ml-1">취소</button></span>`}
+      ${nSPos > 0 && html`<button id="supRegenS" onClick=${regenSupport} className="px-2 py-1 rounded-md border border-teal-300 bg-teal-50 text-teal-800 font-semibold hover:bg-teal-100">🤝 지원 감독만 다시 배정</button>`}
+      ${nForced > 0 && html`<span className="px-2 py-1 rounded-md bg-violet-50 border border-violet-200 text-violet-800">강제 변경 ${nForced}건 <button id="supResetForced" onClick=${() => { if (confirm('강제로 더하거나 없앤 자리를 모두 원래대로 되돌릴까요?')) resetForced(null); }} className="underline ml-1">모두 되돌리기</button></span>`}
     </div>
-    <div className="flex flex-wrap gap-1.5 mb-2 text-[10px]">${[['R', '교실 1-5(정)/(부)'], ['C', '복도'], ['W', '대기'], ['H', '♣ 출제자(본부)'], ['X', '관리·제외'], ['L', '수업']].map(([k, l]) => html`<span key=${k} className=${`px-1.5 py-0.5 rounded border border-slate-200 ${SUP_KIND_CLS[k]}`}>${l}</span>`)}<span className="px-1.5 py-0.5 rounded border border-slate-200 text-slate-400">동 = 같은 과목 시험(교실 불가)</span><span className="px-1.5 py-0.5 rounded ring-2 ring-inset ring-amber-400">3교시 연속 근무(되도록 피함)</span></div>
+    ${pickBar}
+    <div className="flex flex-wrap gap-1.5 mb-2 text-[10px]">${[['R', '교실 1-5(정)/(부)'], ['C', '복도'], ['W', '대기'], ['S', '지원 감독(횟수 미반영)'], ['H', '♣ 출제자(본부)'], ['X', '관리·제외'], ['L', '수업']].map(([k, l]) => html`<span key=${k} className=${`px-1.5 py-0.5 rounded border border-slate-200 ${SUP_KIND_CLS[k]}`}>${l}</span>`)}<span className="px-1.5 py-0.5 rounded border border-slate-200 text-slate-400">동 = 같은 과목 시험(교실 불가)</span><span className="px-1.5 py-0.5 rounded ring-2 ring-inset ring-amber-400">3교시 연속 근무(되도록 피함)</span></div>
     <div className="overflow-auto border border-slate-300 rounded-lg max-h-[72vh] text-[10.5px] 2xl:text-[11.5px]">
       <table className="w-full table-fixed border-collapse" style=${{ minWidth: minW }} id="supGrid">
         <colgroup><col style=${{ width: 88 }} />${S.map(s => html`<col key=${s.key} />`)}${CNT.map(([t, , d]) => html`<col key=${t} className=${cntCls(d)} style=${{ width: 34 }} />`)}</colgroup>
@@ -2890,7 +3207,7 @@ function SuperviseTab({ sup, setSup, m, chk, counts, examTitle, classesByGrade, 
           ${shown.map(t => { const c = counts[t.name]; return html`<tr key=${t.name}>
             <td className="sticky left-0 z-[5] bg-white border border-slate-300 px-1.5 py-0.5 font-semibold leading-tight truncate" title=${[t.home && `${t.home} 담임`, t.only && SUP_ONLY[t.only]].filter(Boolean).join(' · ')}>${t.name}${(t.home || t.only) && html`<div className="text-[9px] font-normal truncate">${t.home && html`<span className="text-slate-400">${t.home}담임 </span>`}${t.only && html`<span className="text-violet-600">${SUP_ONLY[t.only]}</span>`}</div>`}</td>
             ${S.map((s, i) => { const x = supCell(m, s, t.name), err = chk.cellErr[s.key] && chk.cellErr[s.key][t.name], w3 = chk.cellWarn[s.key] && chk.cellWarn[s.key][t.name];
-              const tgt = { k: s.key, t: t.name }, can = !x.fixed && !!x.code;
+              const tgt = { k: s.key, t: t.name }, can = !x.fixed && (!!x.code || x.sr.length > 0);
               return html`<td key=${s.key} data-cell=${`${s.key}|${t.name}`} title=${err || [x.title, w3].filter(Boolean).join(' · ') || (x.same ? `같은 과목 시험: ${x.same.join(', ')} → 교실 감독 불가` : '')}
                 ...${can ? drag(tgt) : {}} ...${dnd(tgt)} onClick=${() => !x.fixed && clickCell(tgt)}
                 className=${`border border-slate-300 px-0.5 py-0.5 text-center whitespace-nowrap overflow-hidden text-ellipsis ${SUP_KIND_CLS[x.kind] || ''} ${dl(i)} ${can ? 'cursor-grab' : x.fixed ? 'cursor-not-allowed' : 'cursor-pointer'} ${err ? 'ring-2 ring-inset ring-rose-500 !bg-rose-50' : w3 ? 'ring-2 ring-inset ring-amber-400' : ''} ${isPick(s.key, t.name) ? 'ring-2 ring-inset ring-indigo-600 !bg-indigo-50' : ''}`}>${x.kind === 'H' ? x.short : x.text}${!x.code && !x.fixed && x.same ? html`<span className="text-[9px] text-slate-400">동</span>` : ''}</td>`; })}
